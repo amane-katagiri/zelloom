@@ -45,10 +45,11 @@ max_parallel = 4
 
 [agents.claude]
 command = ["claude"]
-instruction_flag = "--append-system-prompt"
+instruction_args = ["--append-system-prompt", "{instruction}"]
 
 [agents.codex]
 command = ["codex"]
+instruction_args = ["-c", "developer_instructions={instruction}"]
 ```
 
 エージェントは既定でユーザーの対話シェル（`$SHELL -i`）経由で起動するので、Zellij でタブを手で開いたときと同じく `.bashrc` / `.zshrc` / `config.fish` の `PATH` や環境変数が効く。直接起動したいエージェントには `shell = false` を書く。エージェントや workspace ごとに環境変数を足すこともできる（workspace の値が優先。rc ファイルが同じ変数を設定すると rc の値になる）。
@@ -56,7 +57,7 @@ command = ["codex"]
 ```toml
 [agents.claude]
 command = ["claude"]
-instruction_flag = "--append-system-prompt"
+instruction_args = ["--append-system-prompt", "{instruction}"]
 env = { CLAUDE_CODE_MAX_OUTPUT_TOKENS = "32000" }
 
 [workspaces.myapp]
@@ -64,7 +65,7 @@ path = "/home/you/src/myapp"
 env = { RUST_LOG = "debug" }
 ```
 
-`instruction_flag` を持つエージェント（Claude Code の `--append-system-prompt` など）には、「1タスク=1セッションの仕組みの中で動いていること」と `loom done` の使い方を伝える固定の instruction を、そのフラグ経由で渡す。`instruction_flag` を設定していないエージェントには、instruction をタスク本文の前に連結して渡す。詳細（シェルのラッパ、環境変数のマージ順）は [docs/architecture/config.md](docs/architecture/config.md)。
+エージェントには「1タスク=1セッションの仕組みの中で動いていること」と `loom done` の使い方を伝える固定の instruction を渡す。`instruction_args` を持つエージェントには、その中の `{instruction}` を instruction に置き換えた引数を付けて渡す（Claude Code なら `--append-system-prompt`、Codex なら `-c developer_instructions=...`）。`instruction_args` を設定していないエージェントには、instruction をタスク本文の前に連結して渡す。詳細（シェルのラッパ、環境変数のマージ順）は [docs/architecture/config.md](docs/architecture/config.md)。
 
 ### 2. workspace を登録する
 

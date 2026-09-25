@@ -89,7 +89,7 @@ default_agent = "fake"
 
 [agents.fake]
 command = [{command:?}, "--flag"]
-instruction_flag = "--append-system-prompt"
+instruction_args = ["--append-system-prompt", "{{instruction}}"]
 shell = {shell_enabled}
 env = {{ FAKE_OUT = {out:?}, AGENT_ONLY = "agent", BOTH = "agent", LITERAL = "$HOME x", RC_OVERRIDE = "config" }}
 

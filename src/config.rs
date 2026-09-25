@@ -64,6 +64,8 @@ pub enum ConfigError {
     },
 }
 
+pub const INSTRUCTION_PLACEHOLDER: &str = "{instruction}";
+
 fn default_max_parallel() -> u32 {
     4
 }
@@ -104,7 +106,7 @@ impl Default for SchedulerConfig {
 pub struct AgentConfig {
     pub command: Vec<String>,
     #[serde(default)]
-    pub instruction_flag: Option<String>,
+    pub instruction_args: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub shell: bool,
     #[serde(default)]
@@ -145,6 +147,13 @@ impl Config {
                 return Err(ConfigError::EmptyAgentCommand(name.clone()));
             }
             validate_env(&format!("agent '{name}'"), &agent.env)?;
+            if let Some(args) = &agent.instruction_args
+                && !args.iter().any(|arg| arg.contains(INSTRUCTION_PLACEHOLDER))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "agent '{name}' has instruction_args without {INSTRUCTION_PLACEHOLDER}"
+                )));
+            }
         }
         for (id, ws) in &self.workspaces {
             validate_workspace_id(id)?;
@@ -258,10 +267,11 @@ max_parallel = 4
 
 [agents.claude]
 command = ["claude"]
-instruction_flag = "--append-system-prompt"
+instruction_args = ["--append-system-prompt", "{instruction}"]
 
 [agents.codex]
 command = ["codex"]
+instruction_args = ["-c", "developer_instructions={instruction}"]
 "#;
 
 pub fn init_config(config_path: &Path) -> Result<(), ConfigError> {
@@ -509,7 +519,7 @@ mod tests {
             "claude".to_string(),
             AgentConfig {
                 command: vec!["claude".into()],
-                instruction_flag: None,
+                instruction_args: None,
                 shell: true,
                 env: BTreeMap::new(),
             },
@@ -518,7 +528,7 @@ mod tests {
             "codex".to_string(),
             AgentConfig {
                 command: vec!["codex".into()],
-                instruction_flag: None,
+                instruction_args: None,
                 shell: true,
                 env: BTreeMap::new(),
             },
@@ -527,7 +537,7 @@ mod tests {
             "opus".to_string(),
             AgentConfig {
                 command: vec!["claude".into(), "--model".into(), "opus".into()],
-                instruction_flag: None,
+                instruction_args: None,
                 shell: true,
                 env: BTreeMap::new(),
             },
@@ -699,7 +709,7 @@ mod tests {
             "broken".to_string(),
             AgentConfig {
                 command: vec![],
-                instruction_flag: None,
+                instruction_args: None,
                 shell: true,
                 env: BTreeMap::new(),
             },
@@ -711,7 +721,7 @@ mod tests {
             "broken".to_string(),
             AgentConfig {
                 command: vec![String::new()],
-                instruction_flag: None,
+                instruction_args: None,
                 shell: true,
                 env: BTreeMap::new(),
             },
@@ -898,6 +908,19 @@ mod tests {
     }
 
     #[test]
+    fn instruction_args_require_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[agents.claude]\ncommand = [\"claude\"]\ninstruction_args = [\"--append-system-prompt\"]\n",
+        )
+        .unwrap();
+        let err = load(&config_path).unwrap_err();
+        assert!(err.to_string().contains("{instruction}"), "{err}");
+    }
+
+    #[test]
     fn init_config_writes_valid_template() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("nested").join("config.toml");
@@ -907,10 +930,20 @@ mod tests {
         assert_eq!(config.default_agent.as_deref(), Some("claude"));
         assert_eq!(config.max_parallel(), 4);
         assert_eq!(
-            config.agents["claude"].instruction_flag.as_deref(),
-            Some("--append-system-prompt")
+            config.agents["claude"].instruction_args,
+            Some(vec![
+                "--append-system-prompt".to_string(),
+                "{instruction}".to_string()
+            ])
         );
         assert_eq!(config.agents["codex"].command, vec!["codex".to_string()]);
+        assert_eq!(
+            config.agents["codex"].instruction_args,
+            Some(vec![
+                "-c".to_string(),
+                "developer_instructions={instruction}".to_string()
+            ])
+        );
         assert!(config.workspaces.is_empty());
 
         add_workspace(

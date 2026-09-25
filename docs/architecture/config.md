@@ -29,10 +29,11 @@ max_parallel = 4
 
 [agents.claude]
 command = ["claude"]
-instruction_flag = "--append-system-prompt"
+instruction_args = ["--append-system-prompt", "{instruction}"]
 
 [agents.codex]
 command = ["codex"]
+instruction_args = ["-c", "developer_instructions={instruction}"]
 shell = false
 env = { CODEX_HOME = "/home/you/.codex-zelloom" }
 
@@ -51,7 +52,7 @@ auto_queue = false
 | `default_agent` | 文字列 | 無し | `[agents]` に存在すること |
 | `scheduler.max_parallel` | 整数 | 4 | 特に検証なし |
 | `agents.<name>.command` | 文字列配列（argv） | 必須 | 空配列、または先頭（プログラム名）が空文字列なら設定エラー |
-| `agents.<name>.instruction_flag` | 文字列 | 無し | 無ければ instruction はタスク本文に連結される |
+| `agents.<name>.instruction_args` | 文字列配列 | 無し | instruction を渡す引数。各要素の `{instruction}` を instruction に置き換える。どの要素にも `{instruction}` が無ければ設定エラー。無ければ instruction はタスク本文に連結される |
 | `agents.<name>.shell` | 真偽値 | true | true ならユーザーの対話シェル経由で起動する（[下記](#シェル経由の起動)） |
 | `agents.<name>.env` | 文字列→文字列のテーブル | 空 | agent に渡す環境変数。キーは空文字列・`=` や NUL を含むもの・`ZELLOOM_` で始まるものが設定エラー、値は NUL を含むと設定エラー（`config::validate_env`） |
 | `workspaces.<id>` | テーブル | — | `<id>`（workspace ID）は空文字列・空白や制御文字や `:` を含むものが設定エラー（`config::validate_workspace_id`） |
@@ -86,7 +87,7 @@ When the user explicitly confirms that the current task is finished, run:
 
 argv の組み立て（`build_argv`）:
 
-- `instruction_flag` がある agent（例: `claude` の `--append-system-prompt`）: `command + [instruction_flag, instruction, task.text]`
+- `instruction_args` がある agent: `command + instruction_args（各要素の {instruction} を置換）+ [task.text]`。例: `claude` は `["claude", "--append-system-prompt", instruction, task.text]`、`codex` は `["codex", "-c", "developer_instructions=<instruction>", task.text]`（`-c` の値は TOML として解釈できなければ生の文字列として扱われ、developer ロールのメッセージになる）
 - 無い agent: `command + ["{instruction}\n{task.text}"]`（instruction と本文を改行区切りで1引数に連結）
 
 cwd は workspace の `path`。argv はシェル経由で起動する場合も agent 自身の argv のままで、シェルのラッパは runner が付ける（[下記](#シェル経由の起動)）。
@@ -144,10 +145,11 @@ max_parallel = 4
 
 [agents.claude]
 command = ["claude"]
-instruction_flag = "--append-system-prompt"
+instruction_args = ["--append-system-prompt", "{instruction}"]
 
 [agents.codex]
 command = ["codex"]
+instruction_args = ["-c", "developer_instructions={instruction}"]
 ```
 
 書き込み後、書いたパスと次の手順（`cd <project> && loom workspace add`）を表示する。

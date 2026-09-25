@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
-use crate::config::{self, AgentConfig, Config, WorkspaceConfig};
+use crate::config::{self, AgentConfig, Config, INSTRUCTION_PLACEHOLDER, WorkspaceConfig};
 use crate::protocol::{Outcome, ResolvedAgent, Response, RunnerEvent, Source, Task, TaskStatus};
 use crate::store::{NewTask, Store, StoreError};
 
@@ -93,10 +93,12 @@ fn build_instruction(loom_exe: &str) -> String {
 
 fn build_argv(agent_cfg: &AgentConfig, instruction: &str, text: &str) -> Vec<String> {
     let mut argv = agent_cfg.command.clone();
-    match &agent_cfg.instruction_flag {
-        Some(flag) => {
-            argv.push(flag.clone());
-            argv.push(instruction.to_string());
+    match &agent_cfg.instruction_args {
+        Some(args) => {
+            argv.extend(
+                args.iter()
+                    .map(|arg| arg.replace(INSTRUCTION_PLACEHOLDER, instruction)),
+            );
             argv.push(text.to_string());
         }
         None => {
@@ -907,7 +909,7 @@ mod tests {
     fn env_merge_order_is_agent_then_workspace_then_zelloom() {
         let agent = AgentConfig {
             command: vec!["a".into()],
-            instruction_flag: None,
+            instruction_args: None,
             shell: true,
             env: map(&[
                 ("ONLY_AGENT", "agent"),
@@ -932,6 +934,28 @@ mod tests {
                 ("ZELLOOM_TASK_ID", "t1"),
                 ("ZELLOOM_WORKSPACE", "w"),
             ])
+        );
+    }
+
+    #[test]
+    fn instruction_args_embed_instruction_before_task_text() {
+        let agent = AgentConfig {
+            command: vec!["codex".into()],
+            instruction_args: Some(vec![
+                "-c".into(),
+                "developer_instructions={instruction}".into(),
+            ]),
+            shell: true,
+            env: BTreeMap::new(),
+        };
+        assert_eq!(
+            build_argv(&agent, "be nice\n", "fix it"),
+            vec![
+                "codex".to_string(),
+                "-c".to_string(),
+                "developer_instructions=be nice\n".to_string(),
+                "fix it".to_string(),
+            ]
         );
     }
 }
