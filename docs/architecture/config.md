@@ -45,6 +45,9 @@ env = { RUST_LOG = "debug" }
 
 [sources.nostr]
 auto_queue = false
+
+[tui]
+default_workspace = "myapp"
 ```
 
 | キー | 型 | 既定 | 検証 |
@@ -61,6 +64,7 @@ auto_queue = false
 | `workspaces.<id>.max_parallel` | 整数 | 無し | 指定するなら 1 のみ許可（それ以外は設定エラー） |
 | `workspaces.<id>.env` | 文字列→文字列のテーブル | 空 | `agents.<name>.env` と同じ規則 |
 | `sources.<type>.auto_queue` | 真偽値 | true | — |
+| `tui.default_workspace` | 文字列 | 無し | `[workspaces]` に存在すること。TUI のタスク追加で `ws:` を省略したときの workspace（[tui.md](tui.md)） |
 
 表に無いキーは無視される（エラーにならない）。検証は設定を読み込むたび（CLI・core とも）に `Config::validate` で行う。
 

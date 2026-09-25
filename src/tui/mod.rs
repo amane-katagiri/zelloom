@@ -95,8 +95,11 @@ fn refresh(socket_path: &Path, app: &mut App) {
             Ok(tasks) => {
                 app.core_reachable = true;
                 app.set_tasks(tasks);
-                if let Some(ids) = fetch_workspace_ids(socket_path) {
-                    app.workspace_ids = ids;
+                if let Some(status) = fetch_status(socket_path) {
+                    if let Some(ids) = status.workspaces {
+                        app.workspace_ids = ids;
+                    }
+                    app.default_workspace = status.tui_default_workspace;
                 }
             }
             Err(e) => {
@@ -110,9 +113,15 @@ fn refresh(socket_path: &Path, app: &mut App) {
     }
 }
 
-fn fetch_workspace_ids(socket_path: &Path) -> Option<Vec<String>> {
+#[derive(serde::Deserialize)]
+struct StatusView {
+    workspaces: Option<Vec<String>>,
+    tui_default_workspace: Option<String>,
+}
+
+fn fetch_status(socket_path: &Path) -> Option<StatusView> {
     let status = crate::client::call(socket_path, &Request::Status).ok()?;
-    serde_json::from_value(status.get("workspaces")?.clone()).ok()
+    serde_json::from_value(status).ok()
 }
 
 fn execute_action(socket_path: &Path, app: &mut App, action: Action) {

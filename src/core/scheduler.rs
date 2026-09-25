@@ -444,10 +444,11 @@ impl Scheduler {
         for task in &tasks {
             *counts.entry(task.status.as_str()).or_insert(0) += 1;
         }
-        let workspaces: Option<Vec<String>> = self
-            .load_config()
-            .ok()
+        let config = self.load_config().ok();
+        let workspaces: Option<Vec<String>> = config
+            .as_ref()
             .map(|c| c.workspaces.keys().cloned().collect());
+        let tui_default_workspace = config.and_then(|c| c.tui.default_workspace);
         let runners = self.runners.lock().await;
         let runner_info: Vec<serde_json::Value> = runners
             .iter()
@@ -463,6 +464,7 @@ impl Scheduler {
             "tasks_by_status": counts,
             "runners": runner_info,
             "workspaces": workspaces,
+            "tui_default_workspace": tui_default_workspace,
             "zellij_session_name": self.zellij_session_name,
         }))
     }

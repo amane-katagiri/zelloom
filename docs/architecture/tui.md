@@ -19,7 +19,7 @@
 
 ## ポーリング
 
-500ms 間隔で `List` リクエストを送って `app.set_tasks` に反映し、成功したら続けて `Status` リクエストを送って応答の `workspaces`（core が読んだ設定の workspace ID 一覧）を `app.workspace_ids` に入れる（`refresh`）。`workspaces` が取れなければ前回の一覧を使い続ける。TUI 自身は設定ファイルを読まない。キー入力待ちは `crossterm::event::poll` に残りの待ち時間を渡すので、ポーリングとキー入力待ちが同じループの中で両立する。操作（`Action`）を core に送って成功した直後にも即座にもう一度 `refresh` する（失敗時はエラーを `last_message` に出す）。
+500ms 間隔で `List` リクエストを送って `app.set_tasks` に反映し、成功したら続けて `Status` リクエストを送って応答の `workspaces`（core が読んだ設定の workspace ID 一覧）を `app.workspace_ids` に、`tui_default_workspace` を `app.default_workspace` に入れる（`refresh`）。`workspaces` が取れなければ前回の一覧を使い続ける。TUI 自身は設定ファイルを読まない。キー入力待ちは `crossterm::event::poll` に残りの待ち時間を渡すので、ポーリングとキー入力待ちが同じループの中で両立する。操作（`Action`）を core に送って成功した直後にも即座にもう一度 `refresh` する（失敗時はエラーを `last_message` に出す）。
 
 ## キー操作
 
@@ -62,7 +62,7 @@ core に到達できない（`core_reachable == false`）ときは確認を出�
 
 ## 追加/編集の入力パース
 
-- タスク追加: 入力が `ws: 本文` の形で、コロンより前（前後の空白を除く）が登録済みの workspace ID（`app.workspace_ids`）に一致するときだけ、それを workspace、コロンより後を本文にする。そうでなければ入力全体を本文とし（`fix: ...` のような本文はそのまま残る）、現在選択中のタスクの workspace を既定にする（選択中タスクも無ければエラー）。
+- タスク追加: 入力が `ws: 本文` の形で、コロンより前（前後の空白を除く）が登録済みの workspace ID（`app.workspace_ids`）に一致するときだけ、それを workspace、コロンより後を本文にする。そうでなければ入力全体を本文とし（`fix: ...` のような本文はそのまま残る）、`app.default_workspace`（設定の `tui.default_workspace`）があればそれ、無ければ現在選択中のタスクの workspace を既定にする（どちらも無ければエラー）。
 - 編集: 選択中タスクの本文をあらかじめバッファに入れておき、`Enter` で本文だけを置き換える（workspace や状態は変えない）。
 
 ## Zellij へのフォーカス移動

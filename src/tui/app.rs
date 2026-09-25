@@ -57,6 +57,7 @@ pub struct App {
     pub last_message: Option<String>,
     pub core_reachable: bool,
     pub workspace_ids: Vec<String>,
+    pub default_workspace: Option<String>,
 }
 
 pub const SECTION_STATUSES: [&[TaskStatus]; 4] = [
@@ -96,6 +97,7 @@ impl App {
             last_message: None,
             core_reachable: true,
             workspace_ids: Vec::new(),
+            default_workspace: None,
         }
     }
 
@@ -187,8 +189,9 @@ impl App {
             return Err("task text is empty".to_string());
         }
         let workspace = self
-            .selected_task()
-            .map(|t| t.workspace.clone())
+            .default_workspace
+            .clone()
+            .or_else(|| self.selected_task().map(|t| t.workspace.clone()))
             .ok_or_else(|| {
                 "no workspace given (use 'ws: text') and no task selected".to_string()
             })?;
@@ -562,6 +565,26 @@ mod tests {
             action,
             Action::Enqueue {
                 workspace: "amanejp".to_string(),
+                text: "no prefix here".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn add_input_without_prefix_prefers_default_workspace() {
+        let mut app = App::new();
+        app.workspace_ids = vec!["amanejp".to_string(), "other".to_string()];
+        app.default_workspace = Some("other".to_string());
+        app.set_tasks(vec![task("1", TaskStatus::Queued, "amanejp", "one", 1)]);
+        app.handle_key(key(KeyCode::Char('n')));
+        for c in "no prefix here".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let action = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            Action::Enqueue {
+                workspace: "other".to_string(),
                 text: "no prefix here".to_string(),
             }
         );

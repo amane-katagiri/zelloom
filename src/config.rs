@@ -86,6 +86,14 @@ pub struct Config {
     pub workspaces: BTreeMap<String, WorkspaceConfig>,
     #[serde(default)]
     pub sources: BTreeMap<String, SourceConfig>,
+    #[serde(default)]
+    pub tui: TuiConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct TuiConfig {
+    #[serde(default)]
+    pub default_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -179,6 +187,13 @@ impl Config {
             && !self.agents.contains_key(default_agent)
         {
             return Err(ConfigError::UnknownDefaultAgent(default_agent.clone()));
+        }
+        if let Some(workspace) = &self.tui.default_workspace
+            && !self.workspaces.contains_key(workspace)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "tui.default_workspace '{workspace}' is not registered in [workspaces]"
+            )));
         }
         Ok(())
     }
@@ -1040,5 +1055,16 @@ env = { BAR = "日本語\n" }
         let err =
             parse("[agents.a]\ncommand = [\"a\"]\nenv = { K = \"a\\u0000b\" }\n").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidEnvValue { .. }), "{err}");
+    }
+
+    #[test]
+    fn tui_default_workspace_must_be_registered() {
+        let config =
+            parse("[workspaces.w]\npath = \"/tmp/w\"\n\n[tui]\ndefault_workspace = \"w\"\n")
+                .unwrap();
+        assert_eq!(config.tui.default_workspace.as_deref(), Some("w"));
+        let err = parse("[workspaces.w]\npath = \"/tmp/w\"\n\n[tui]\ndefault_workspace = \"x\"\n")
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
     }
 }

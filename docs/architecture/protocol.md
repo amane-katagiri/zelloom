@@ -80,11 +80,12 @@ core と各クライアントは Unix domain socket 上の JSON Lines で通信�
   "tasks_by_status": {"done": 3, "queued": 1, "running": 1},
   "runners": [{"workspace": "myapp", "attached": true, "current_task": "01K5Q3..."}],
   "workspaces": ["myapp", "other"],
+  "tui_default_workspace": "myapp",
   "zellij_session_name": "main"
 }
 ```
 
-`runners` は接続中の runner だけを含み（`attached` は常に true）、`current_task` は無ければ null。`workspaces` は core がその時点で読んだ設定の workspace ID 一覧（設定が読めなければ null）。`zellij_session_name` は core 起動時の `ZELLIJ_SESSION_NAME`（無ければ null）。
+`runners` は接続中の runner だけを含み（`attached` は常に true）、`current_task` は無ければ null。`workspaces` は core がその時点で読んだ設定の workspace ID 一覧（設定が読めなければ null）。`tui_default_workspace` は設定の `tui.default_workspace`（未設定または設定が読めなければ null）。`zellij_session_name` は core 起動時の `ZELLIJ_SESSION_NAME`（無ければ null）。
 
 `force` なしの `shutdown` が `running` のタスクのために拒否されたときは、`data` に実行中のタスクを入れて返す。確認とシャットダウンの開始は scheduler のロックの中で行うので、確認の直後に別のタスクが始まることはない。
 
