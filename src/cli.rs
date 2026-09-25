@@ -65,6 +65,17 @@ pub enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Manage the config file
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Open the config file in $VISUAL or $EDITOR (falls back to vi) and validate it afterwards
+    Edit,
 }
 
 #[derive(Subcommand)]
@@ -106,6 +117,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Workspace { command }) => match command {
             WorkspaceCommand::Add { id, agent, path } => cmd_workspace_add(id, agent, path),
             WorkspaceCommand::List => cmd_workspace_list(),
+        },
+        Some(Command::Config { command }) => match command {
+            ConfigCommand::Edit => cmd_config_edit(),
         },
     }
 }
@@ -375,6 +389,35 @@ fn cmd_init() -> anyhow::Result<()> {
     crate::config::init_config(&config_path)?;
     println!("wrote {}", config_path.display());
     println!("next: cd <project> && loom workspace add");
+    Ok(())
+}
+
+fn cmd_config_edit() -> anyhow::Result<()> {
+    let config_path = crate::paths::config_path();
+    if !config_path.exists() {
+        anyhow::bail!(
+            "config file {} does not exist; create it with `loom init`",
+            config_path.display()
+        );
+    }
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string());
+    // Run through sh so that editors with arguments such as "code --wait" work, as git does.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor)
+        .arg(&config_path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run editor {editor:?}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("editor {editor:?} exited with {status}");
+    }
+    crate::config::load(&config_path)?;
+    println!("{} is valid", config_path.display());
     Ok(())
 }
 

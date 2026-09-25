@@ -158,6 +158,14 @@ instruction_args = ["-c", "developer_instructions={instruction}"]
 
 書き込み後、書いたパスと次の手順（`cd <project> && loom workspace add`）を表示する。
 
+## `loom config edit`
+
+`paths::config_path()` のファイルをエディタで開く。ファイルが無ければエディタを起動せず、`loom init` を促すエラーにする。
+
+- エディタは `VISUAL`、`EDITOR` の順で空でない最初のものを使い、どちらも無ければ `vi`。
+- 値に引数を含められるよう（`code --wait` など）、`sh -c '<editor> "$@"' <editor> <path>` で起動する。
+- エディタが非 0 で終了したらエラーにする。正常終了したら `config::load` で読み直し、エラーがあれば表示して非 0 で終了、無ければ `<path> is valid` を表示する。ファイルは元に戻さない。
+
 ## `workspace add` の書き込み
 
 ### パスと ID の決定

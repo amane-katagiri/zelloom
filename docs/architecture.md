@@ -11,7 +11,7 @@ zelloom（バイナリ名 `loom`）は、対話型コーディングエージェ
 | core | `loom core`（通常は `loom` がデタッチ起動。`loom stop` で停止） | Unix socket サーバ。タスクの永続化（SQLite）、グローバルキュー、scheduler、runner への指示を持つ唯一の状態所有者 |
 | runner | `loom runner <workspace>`（core が Zellij タブで起動） | workspace タブに常駐し、タスクごとにエージェントを子プロセス（別プロセスグループ）として起動・停止する |
 | TUI | 素の `loom`（実行した端末・ペインでそのまま動く） | core をポーリングして一覧表示し、操作をリクエストとして送るだけのクライアント |
-| CLI | `loom add` / `loom done` / `loom list` / `loom stop` / `loom init` / `loom workspace ...` | 1 リクエスト 1 応答のクライアント。`init` と `workspace` は core を介さず設定ファイルを直接読み書きする。内部用の `core` と `runner` は `--help` に出さない |
+| CLI | `loom add` / `loom done` / `loom list` / `loom stop` / `loom init` / `loom config edit` / `loom workspace ...` | 1 リクエスト 1 応答のクライアント。`init`・`config`・`workspace` は core を介さず設定ファイルを直接読み書きする。内部用の `core` と `runner` は `--help` に出さない |
 | Zellij launcher | core 内（`launcher.rs`） | runner が未接続の workspace に対し、`zellij action` でタブを作って runner を起動する |
 
 ## プロセスと IPC
@@ -47,7 +47,7 @@ zelloom（バイナリ名 `loom`）は、対話型コーディングエージェ
 |---|---|---|
 | `src/main.rs` | clap でパースして `cli::dispatch` を呼ぶだけ | — |
 | `src/lib.rs` | モジュール宣言 | — |
-| `src/cli.rs` | サブコマンド定義と実装。素の `loom`（必要なら core をデタッチ起動してから、その場で TUI を実行）、`loom stop` | [zellij.md](architecture/zellij.md)、[config.md](architecture/config.md) |
+| `src/cli.rs` | サブコマンド定義と実装。素の `loom`（必要なら core をデタッチ起動してから、その場で TUI を実行）、`loom stop`、`loom config edit` | [zellij.md](architecture/zellij.md)、[config.md](architecture/config.md) |
 | `src/paths.rs` | 設定・状態・ソケットのパス解決と `--socket` の上書き | [config.md](architecture/config.md) |
 | `src/config.rs` | 設定の読み込み・検証、agent 解決、`init` のテンプレート書き込み、`workspace add` のパス・ID 決定と書き込み、cwd からの workspace 自動判定 | [config.md](architecture/config.md) |
 | `src/protocol.rs` | リクエスト・応答・runner イベント・`Task` の型 | [protocol.md](architecture/protocol.md) |

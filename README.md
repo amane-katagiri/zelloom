@@ -183,6 +183,7 @@ loom stop
 | `loom list` | タスクの一覧を表示します |
 | `loom stop [--force]` | core を止めます |
 | `loom init` | 設定ファイルのひな形を作ります |
+| `loom config edit` | 設定ファイルをエディタ（`$VISUAL` → `$EDITOR` → `vi`）で開き、閉じたあとに内容を検査します |
 | `loom workspace add [ID] [--path パス] [--agent AGENT]` | workspace を登録します |
 | `loom workspace list` | 登録済みの workspace を表示します |
 
