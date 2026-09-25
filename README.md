@@ -232,6 +232,8 @@ instruction_args = ["-c", "developer_instructions={instruction}"]
 | `workspaces.<ID>.env` | なし | この workspace で起動するエージェントに渡す環境変数 |
 | `tui.default_workspace` | なし | 管理画面でタスクを追加するときの既定の workspace |
 | `sources.cli.auto_queue` | `true` | 追加したタスクをすぐキューに入れるか |
+| `http.listen` | なし | HTTP でタスクを追加できるようにする（[詳細](docs/architecture/http.md)） |
+| `http.allowed_origins` | 空 | HTTP アダプタで許可するブラウザの Origin |
 
 知らない項目は無視されます（エラーにはなりません）。綴りを間違えても何も起きないので注意してください。
 
@@ -394,7 +396,17 @@ default_workspace = "myapp"
 auto_queue = false
 ```
 
-既定では、追加したタスクはすぐに順番待ち（QUEUED）に入ります。`auto_queue = false` にすると、追加したタスクはいったん INBOX に置かれ、管理画面で `a` を押して受け入れるまで実行されません。あとでまとめて見直してから流したいときに使います。今のところ、タスクの追加元は `loom add` と管理画面（どちらも `cli` 扱い）だけです。
+既定では、追加したタスクはすぐに順番待ち（QUEUED）に入ります。`auto_queue = false` にすると、追加したタスクはいったん INBOX に置かれ、管理画面で `a` を押して受け入れるまで実行されません。あとでまとめて見直してから流したいときに使います。`loom add` と管理画面からの追加は `cli` 扱い、後述の HTTP アダプタ経由の追加は `http` 扱いで、`[sources.<種類>]` として別々に設定できます。
+
+### HTTP でタスクを追加する
+
+```toml
+[http]
+listen = "127.0.0.1:7878"
+allowed_origins = ["http://localhost:5173"]
+```
+
+`[http]` を設定すると、core の中に `POST /tasks` だけを受け付ける HTTP サーバが立ち上がります。`listen` は loopback アドレス（`127.0.0.1` や `[::1]`）に限られ、ブラウザから叩く場合は `allowed_origins` にその Origin を登録します。詳しいセキュリティ上の仕組みは [docs/architecture/http.md](docs/architecture/http.md) を参照してください。`[http]` の変更は core の再起動後に反映されます。
 
 ### 環境変数とファイルの場所
 
@@ -430,4 +442,5 @@ auto_queue = false
 - Zellij との連携: [docs/architecture/zellij.md](docs/architecture/zellij.md)
 - 管理画面: [docs/architecture/tui.md](docs/architecture/tui.md)
 - core との通信: [docs/architecture/protocol.md](docs/architecture/protocol.md)
+- HTTP アダプタ: [docs/architecture/http.md](docs/architecture/http.md)
 - 最初の設計案（今の実装とは違う部分があります）: [docs/plan.md](docs/plan.md)

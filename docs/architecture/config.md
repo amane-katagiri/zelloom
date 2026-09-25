@@ -48,6 +48,10 @@ auto_queue = false
 
 [tui]
 default_workspace = "myapp"
+
+[http]
+listen = "127.0.0.1:7878"
+allowed_origins = ["http://localhost:5173"]
 ```
 
 | キー | 型 | 既定 | 検証 |
@@ -66,8 +70,10 @@ default_workspace = "myapp"
 | `workspaces.<id>.env` | 文字列→文字列のテーブル | 空 | `agents.<name>.env` と同じ規則 |
 | `sources.<type>.auto_queue` | 真偽値 | true | — |
 | `tui.default_workspace` | 文字列 | 無し | `[workspaces]` に存在すること。TUI のタスク追加で `ws:` を省略したときの workspace（[tui.md](tui.md)） |
+| `http.listen` | 文字列 | 無し（`[http]` があれば必須） | `SocketAddr` としてパースできること（ホスト名不可）、かつ loopback アドレスであること。詳細は [http.md](http.md) |
+| `http.allowed_origins` | 文字列配列 | 空 | 各要素が `http://host[:port]` または `https://host[:port]`（パス・クエリ・末尾スラッシュ不可）であること |
 
-表に無いキーは無視される（エラーにならない）。検証は設定を読み込むたび（CLI・core とも）に `Config::validate` で行う。
+表に無いキーは無視される（エラーにならない）。検証は設定を読み込むたび（CLI・core とも）に `Config::validate` で行う。`[http]` は他のキーと違い、core が起動時に読んだ内容だけを使い続ける（[http.md](http.md#ライフサイクル)）。
 
 ## agent の解決と argv
 
@@ -156,6 +162,13 @@ instruction_args = ["--append-system-prompt", "{instruction}"]
 [agents.codex]
 command = ["codex"]
 instruction_args = ["-c", "developer_instructions={instruction}"]
+
+# Uncomment to accept tasks over HTTP from a local tool (see docs/architecture/http.md).
+# [http]
+# listen = "127.0.0.1:7878"
+# allowed_origins = ["http://localhost:5173"]
+# [sources.http]
+# auto_queue = false  # hold HTTP tasks as received until accepted in the TUI
 ```
 
 書き込み後、書いたパスと次の手順（`cd <project> && loom workspace add`）を表示する。

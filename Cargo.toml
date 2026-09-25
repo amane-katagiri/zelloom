@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 jiff = "0.2.37"
@@ -26,6 +27,7 @@ thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "signal"] }
 toml = "1.1.6"
 toml_edit = "0.25.15"
+tower-http = { version = "0.7.1", features = ["cors"] }
 ulid = "3.0.0"
 unicode-width = "0.2.2"
 

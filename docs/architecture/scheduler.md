@@ -106,7 +106,9 @@ interrupted にした場合は `schedule()` を呼ぶ。
 ## core の起動と終了
 
 - 起動時、ソケットファイルが既にあれば接続を試みる。接続できれば「別の core が動いている」としてエラー終了、できなければ古いファイルとして消す。
+- 続けて設定ファイルを読み、`[http]` があれば TCP リスナーを bind する（[http.md](http.md#ライフサイクル)）。設定の読み込みか bind に失敗すると core は起動しない。
 - DB を開いた直後に `running` のタスクをすべて `interrupted` にする。
 - `shutdown` は `force` が false なら `running` のタスクがあるとき拒否する（[protocol.md](protocol.md#リクエスト一覧)）。受け付けると以後 `schedule()` は何もしない（新しいタスクの割り当ても タブの起動もしない）。
 - 受け付けたあとは待ち受けを止めてソケットファイルを消し、開いている接続をすべて閉じ、接続処理の終了を待ってから終了する。runner の接続は切断として扱われるので、実行中だったタスクはその場で `interrupted` になる。runner が未接続のまま `running` だったタスク（attach 待ち）は残り、次の起動時に `interrupted` になる。
+- HTTP サーバが起動していれば、同じ shutdown の通知（`subscribe_shutdown`）を使って axum の graceful shutdown を行う。`core::run` はソケットの後始末が終わったあと、HTTP サーバのタスクが終わるのを待ってから戻る（[http.md](http.md#ライフサイクル)）。
 - 切断された runner は、待機中ならすぐ終了し、agent 実行中なら agent が終わるのを待ってから終了する（[runner.md](runner.md#core-との切断)）。

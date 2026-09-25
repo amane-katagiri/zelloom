@@ -56,5 +56,5 @@ runner タブは、名前が workspace ID に一致し、かつ **runner ペイ�
 `loom`（サブコマンド無し）は次を行う（`src/cli.rs` の `run_bare_loom` と `ensure_core`）。
 
 1. ソケットに接続できれば core は動いているとみなし、Zellij の有無に関係なく 3 へ進む。
-2. 接続できなければ、`ZELLIJ_SESSION_NAME` が無い場合は「core は Zellij セッションの中から起動する必要がある」というエラーで終了する。ある場合は core をデタッチ起動する（`setsid` した子プロセスとして `loom --socket <path> core` を起動し、stdin は `/dev/null`、stdout/stderr は状態ディレクトリの `core.log` に追記する。TUI の端末は引き継がない）。ソケットができるまで最大 5 秒待つ。
+2. 接続できなければ、`ZELLIJ_SESSION_NAME` が無い場合は「core は Zellij セッションの中から起動する必要がある」というエラーで終了する。ある場合は core をデタッチ起動する（`setsid` した子プロセスとして `loom --socket <path> core` を起動し、stdin は `/dev/null`、stdout/stderr は状態ディレクトリの `core.log` に追記する。TUI の端末は引き継がない）。ソケットができるまで最大 5 秒待つ。その間に core が終了したら `loom core exited during startup (<status>); see <core.log>` で終了する。
 3. 実行した端末（ペイン）で、そのまま管理 TUI（`tui::run`）を動かす。タブの作成・検索・移動はしない。

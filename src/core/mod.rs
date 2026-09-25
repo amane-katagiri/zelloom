@@ -28,6 +28,27 @@ pub async fn run(options: CoreOptions) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    let initial_config = crate::config::load(&options.config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load config {}: {e}",
+            options.config_path.display()
+        )
+    })?;
+
+    let http_listener = match &initial_config.http {
+        Some(http_cfg) => {
+            let addr = http_cfg.listen_addr();
+            let std_listener = std::net::TcpListener::bind(addr)
+                .map_err(|e| anyhow::anyhow!("failed to bind http listener on {addr}: {e}"))?;
+            std_listener.set_nonblocking(true)?;
+            Some((
+                tokio::net::TcpListener::from_std(std_listener)?,
+                http_cfg.clone(),
+            ))
+        }
+        None => None,
+    };
+
     let store = Arc::new(Store::open(&options.db_path)?);
     let interrupted = store.mark_all_running_interrupted()?;
     if interrupted > 0 {
@@ -36,6 +57,7 @@ pub async fn run(options: CoreOptions) -> anyhow::Result<()> {
 
     let zellij_session_name = std::env::var("ZELLIJ_SESSION_NAME").ok();
     let attach_timeout = attach_timeout_from_env();
+    let http_socket_path = options.socket_path.clone();
 
     let scheduler = Arc::new(Scheduler::new(
         store,
@@ -51,6 +73,21 @@ pub async fn run(options: CoreOptions) -> anyhow::Result<()> {
         "[zelloom-core] listening on {}",
         options.socket_path.display()
     );
+
+    let http_task = match http_listener {
+        Some((tcp_listener, http_cfg)) => {
+            let addr = tcp_listener.local_addr()?;
+            eprintln!("[zelloom-core] http listening on {addr}");
+            let shutdown_rx = scheduler.subscribe_shutdown();
+            Some(tokio::spawn(crate::http::serve(
+                tcp_listener,
+                http_cfg,
+                http_socket_path,
+                shutdown_rx,
+            )))
+        }
+        None => None,
+    };
 
     let mut shutdown = scheduler.subscribe_shutdown();
     let mut connections = JoinSet::new();
@@ -76,6 +113,15 @@ pub async fn run(options: CoreOptions) -> anyhow::Result<()> {
     drop(listener);
     let _ = std::fs::remove_file(&options.socket_path);
     while connections.join_next().await.is_some() {}
+
+    if let Some(task) = http_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("[zelloom-core] http server error: {e}"),
+            Err(e) => eprintln!("[zelloom-core] http server task panicked: {e}"),
+        }
+    }
+
     Ok(())
 }
 

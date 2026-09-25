@@ -56,6 +56,10 @@ pub enum ConfigError {
     MissingConfig { path: PathBuf },
     #[error("config file {} already exists; not overwriting it", path.display())]
     ConfigAlreadyExists { path: PathBuf },
+    #[error("http.listen '{value}' is invalid: {reason}")]
+    InvalidHttpListen { value: String, reason: &'static str },
+    #[error("http.allowed_origins entry '{value}' is invalid: {reason}")]
+    InvalidHttpOrigin { value: String, reason: &'static str },
     #[error("failed to edit config file {path}: {source}")]
     TomlEdit {
         path: PathBuf,
@@ -88,12 +92,32 @@ pub struct Config {
     pub sources: BTreeMap<String, SourceConfig>,
     #[serde(default)]
     pub tui: TuiConfig,
+    #[serde(default)]
+    pub http: Option<HttpConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct TuiConfig {
     #[serde(default)]
     pub default_workspace: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct HttpConfig {
+    pub listen: String,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+impl HttpConfig {
+    // Config::validate already parsed `listen` once to check it; keeping the field as a plain
+    // String (rather than SocketAddr) lets an invalid value surface as a normal ConfigError
+    // instead of a serde parse error.
+    pub fn listen_addr(&self) -> std::net::SocketAddr {
+        self.listen
+            .parse()
+            .expect("http.listen was validated by Config::validate")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -202,6 +226,22 @@ impl Config {
                 "tui.default_workspace '{workspace}' is not registered in [workspaces]"
             )));
         }
+        if let Some(http) = &self.http {
+            if let Err(reason) = validate_http_listen(&http.listen) {
+                return Err(ConfigError::InvalidHttpListen {
+                    value: http.listen.clone(),
+                    reason,
+                });
+            }
+            for origin in &http.allowed_origins {
+                if let Err(reason) = validate_http_origin(origin) {
+                    return Err(ConfigError::InvalidHttpOrigin {
+                        value: origin.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -260,6 +300,33 @@ fn validate_env(owner: &str, env: &BTreeMap<String, String>) -> Result<(), Confi
     Ok(())
 }
 
+fn validate_http_listen(value: &str) -> Result<(), &'static str> {
+    let addr: std::net::SocketAddr = value
+        .parse()
+        .map_err(|_| "must be an ip:port socket address (hostnames are not allowed)")?;
+    if !addr.ip().is_loopback() {
+        return Err("must be a loopback address (127.0.0.0/8 or ::1)");
+    }
+    Ok(())
+}
+
+fn validate_http_origin(value: &str) -> Result<(), &'static str> {
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .ok_or("must start with http:// or https://")?;
+    if rest.is_empty() {
+        return Err("missing host");
+    }
+    if rest.contains(['/', '?', '#', '@', ' ']) {
+        return Err("must not contain a path, query, fragment or userinfo");
+    }
+    if rest.ends_with(':') {
+        return Err("must not have an empty port");
+    }
+    Ok(())
+}
+
 pub fn validate_workspace_id(id: &str) -> Result<(), ConfigError> {
     let reason = if id.is_empty() {
         Some("must not be empty")
@@ -294,6 +361,13 @@ instruction_args = ["--append-system-prompt", "{instruction}"]
 [agents.codex]
 command = ["codex"]
 instruction_args = ["-c", "developer_instructions={instruction}"]
+
+# Uncomment to accept tasks over HTTP from a local tool (see docs/architecture/http.md).
+# [http]
+# listen = "127.0.0.1:7878"
+# allowed_origins = ["http://localhost:5173"]
+# [sources.http]
+# auto_queue = false  # hold HTTP tasks as received until accepted in the TUI
 "#;
 
 pub fn init_config(config_path: &Path) -> Result<(), ConfigError> {
@@ -1080,6 +1154,56 @@ env = { BAR = "日本語\n" }
         let err =
             parse("[agents.a]\ncommand = [\"a\"]\nenv = { K = \"a\\u0000b\" }\n").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidEnvValue { .. }), "{err}");
+    }
+
+    #[test]
+    fn http_listen_must_be_loopback_socket_addr() {
+        for bad in ["0.0.0.0:7878", "127.0.0.1", "localhost:7878", "not-an-addr"] {
+            let text = format!("[http]\nlisten = \"{bad}\"\n");
+            let err = parse(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidHttpListen { .. }),
+                "{bad:?}: {err}"
+            );
+        }
+        parse("[http]\nlisten = \"127.0.0.1:7878\"\n").unwrap();
+        parse("[http]\nlisten = \"[::1]:7878\"\n").unwrap();
+    }
+
+    #[test]
+    fn http_allowed_origins_must_be_bare_origins() {
+        for bad in [
+            "not-a-url",
+            "ftp://localhost:5173",
+            "http://localhost:5173/",
+            "http://localhost:5173/path",
+            "http://localhost:5173?x=1",
+            "http://",
+        ] {
+            let text =
+                format!("[http]\nlisten = \"127.0.0.1:7878\"\nallowed_origins = [\"{bad}\"]\n");
+            let err = parse(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidHttpOrigin { .. }),
+                "{bad:?}: {err}"
+            );
+        }
+        let config = parse(
+            "[http]\nlisten = \"127.0.0.1:7878\"\nallowed_origins = [\"http://localhost:5173\", \"https://example.com\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.http.unwrap().allowed_origins,
+            vec![
+                "http://localhost:5173".to_string(),
+                "https://example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn http_absent_by_default() {
+        assert_eq!(Config::default().http, None);
     }
 
     #[test]

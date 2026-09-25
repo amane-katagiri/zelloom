@@ -151,15 +151,15 @@ pub fn ensure_core(socket_path: &std::path::Path) -> anyhow::Result<()> {
             socket_path.display()
         );
     }
-    spawn_detached_core(socket_path)?;
-    wait_for_core_socket(socket_path, std::time::Duration::from_secs(5))
+    let mut child = spawn_detached_core(socket_path)?;
+    wait_for_core_socket(&mut child, socket_path, std::time::Duration::from_secs(5))
 }
 
 fn core_is_listening(socket_path: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket_path).is_ok()
 }
 
-fn spawn_detached_core(socket_path: &std::path::Path) -> anyhow::Result<()> {
+fn spawn_detached_core(socket_path: &std::path::Path) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()?;
@@ -185,11 +185,11 @@ fn spawn_detached_core(socket_path: &std::path::Path) -> anyhow::Result<()> {
             Ok(())
         });
     }
-    command.spawn()?;
-    Ok(())
+    Ok(command.spawn()?)
 }
 
 fn wait_for_core_socket(
+    child: &mut std::process::Child,
     socket_path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
@@ -197,6 +197,12 @@ fn wait_for_core_socket(
     while start.elapsed() < timeout {
         if core_is_listening(socket_path) {
             return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "loom core exited during startup ({status}); see {}",
+                crate::paths::log_dir().join("core.log").display()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
