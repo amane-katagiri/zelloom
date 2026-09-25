@@ -49,7 +49,8 @@
 | `stop` を受けた（core 接続は生きている） | 待機に戻る。`agent_exited` は送らない（core が状態を確定済み） |
 | `stop` を受け、かつ core との接続が切れた | runner を終了する |
 | agent が自分で終了し、core との接続が切れていた | agent の終了を待ってから runner を終了する（接続が切れても agent は止めない） |
-| agent が自分で終了した（上記以外） | プロンプトを出す（下記） |
+| agent が自分で終了した（上記以外）で `agent.oneshot` が true | 終了コード 0 なら `agent_exited`（`done`）、それ以外（シグナルによる終了や `wait` の失敗を含む）なら `failed` を送って待機に戻る。送れなかったら runner を終了する |
+| agent が自分で終了した（上記以外）で `agent.oneshot` が false | プロンプトを出す（下記） |
 
 ## 自発終了時のプロンプト
 

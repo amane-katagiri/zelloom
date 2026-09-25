@@ -225,6 +225,7 @@ instruction_args = ["-c", "developer_instructions={instruction}"]
 | `agents.<名前>.command` | （必須） | エージェントを起動するコマンド |
 | `agents.<名前>.instruction_args` | なし | zelloom からの指示をエージェントに渡すための引数 |
 | `agents.<名前>.shell` | `true` | ログインしたときと同じシェル経由で起動するか |
+| `agents.<名前>.oneshot` | `false` | 対話せずに 1 回実行して終わるエージェントとして扱うか |
 | `agents.<名前>.env` | なし | エージェントに渡す環境変数 |
 | `workspaces.<ID>.path` | （必須） | プロジェクトのディレクトリ |
 | `workspaces.<ID>.agent` | なし | この workspace で使うエージェント |
@@ -292,6 +293,27 @@ shell = false
 - rc ファイルで定義したエイリアスやシェル関数は、`command` の先頭に書いても使えません。`PATH` にある実行ファイルを指定してください。
 - csh や tcsh をログインシェルにしている場合は、`shell = false` にしてください（bash・zsh・fish・sh などは問題ありません）。
 - コマンドが見つからない場合は、シェルがエラーを表示して終了します。タブには「[エージェントが途中で終了してしまったら](#エージェントが途中で終了してしまったら)」と同じ確認が出ます。
+
+#### 対話せずにタスクを順番にこなす（`oneshot`）
+
+`claude -p` や `codex exec` のように、本文を受け取って作業し、終わったら自分で終了するモードのエージェントを使うと、タスクを人の確認なしで次々に実行できます。
+
+```toml
+[agents.claude-p]
+command = ["claude", "-p"]
+oneshot = true
+```
+
+```sh
+loom add --agent claude-p "READMEの誤字を直す"
+```
+
+`oneshot = true` のエージェントは次のように動きます。
+
+- zelloom からの指示は渡さず、`command` の後ろにタスクの本文だけを付けて起動します。`instruction_args` と一緒には書けません（設定エラーになります）。
+- エージェントが終了すると、確認を出さずに、終了コードが 0 なら完了、それ以外なら失敗として記録し、同じ workspace の次のタスクへ進みます。失敗したタスクは管理画面からやり直せます。
+
+エージェントの出力はタブに表示されるだけで、保存はされません。
 
 #### 環境変数を渡す（`env`）
 

@@ -109,7 +109,7 @@ runner は接続直後に `runner_attach` を送る。core は `{"ok":true}` を
 ```text
 runner → core  {"op":"runner_attach","workspace":"myapp"}
 core → runner  {"ok":true}
-core → runner  {"event":"start","task":{...Task...},"agent":{"argv":[...],"cwd":"...","env":{...},"shell":true}}
+core → runner  {"event":"start","task":{...Task...},"agent":{"argv":[...],"cwd":"...","env":{...},"shell":true,"oneshot":false}}
                ... agent 実行中 ...
 core → runner  {"event":"stop","task_id":"01K5Q3..."}
 ```
@@ -131,7 +131,8 @@ core → runner  {"event":"stop","task_id":"01K5Q3..."}
       "ZELLOOM_TASK_ID": "01K5Q3...",
       "ZELLOOM_WORKSPACE": "myapp"
     },
-    "shell": true
+    "shell": true,
+    "oneshot": false
   }
 }
 ```
@@ -142,6 +143,7 @@ core → runner  {"event":"stop","task_id":"01K5Q3..."}
 - `cwd`: workspace の `path`。
 - `env`: agent に設定する環境変数。設定の `env` と `ZELLOOM_*` をマージ済み（[config.md](config.md#agent-の環境変数)）。
 - `shell`: 設定の `agents.<name>.shell`。true なら runner が自分の `$SHELL` の対話モードで `argv` を包んで起動する（[runner.md](runner.md#タスクの実行)）。ラッパは core ではなく runner が、runner 自身の `$SHELL` で組み立てる。
+- `oneshot`: 設定の `agents.<name>.oneshot`。true なら runner は自発終了時にプロンプトを出さず、終了コードで結果を決める（[runner.md](runner.md#終了後の分岐)）。
 
 `start` が送られるのは次のとき。
 

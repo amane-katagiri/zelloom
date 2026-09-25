@@ -118,6 +118,8 @@ pub struct AgentConfig {
     #[serde(default = "default_true")]
     pub shell: bool,
     #[serde(default)]
+    pub oneshot: bool,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 
@@ -160,6 +162,11 @@ impl Config {
             {
                 return Err(ConfigError::Invalid(format!(
                     "agent '{name}' has instruction_args without {INSTRUCTION_PLACEHOLDER}"
+                )));
+            }
+            if agent.oneshot && agent.instruction_args.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "agent '{name}' is oneshot and cannot have instruction_args"
                 )));
             }
         }
@@ -536,6 +543,7 @@ mod tests {
                 command: vec!["claude".into()],
                 instruction_args: None,
                 shell: true,
+                oneshot: false,
                 env: BTreeMap::new(),
             },
         );
@@ -545,6 +553,7 @@ mod tests {
                 command: vec!["codex".into()],
                 instruction_args: None,
                 shell: true,
+                oneshot: false,
                 env: BTreeMap::new(),
             },
         );
@@ -554,6 +563,7 @@ mod tests {
                 command: vec!["claude".into(), "--model".into(), "opus".into()],
                 instruction_args: None,
                 shell: true,
+                oneshot: false,
                 env: BTreeMap::new(),
             },
         );
@@ -726,6 +736,7 @@ mod tests {
                 command: vec![],
                 instruction_args: None,
                 shell: true,
+                oneshot: false,
                 env: BTreeMap::new(),
             },
         );
@@ -738,6 +749,7 @@ mod tests {
                 command: vec![String::new()],
                 instruction_args: None,
                 shell: true,
+                oneshot: false,
                 env: BTreeMap::new(),
             },
         );
@@ -933,6 +945,19 @@ mod tests {
         .unwrap();
         let err = load(&config_path).unwrap_err();
         assert!(err.to_string().contains("{instruction}"), "{err}");
+    }
+
+    #[test]
+    fn oneshot_rejects_instruction_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[agents.claude]\ncommand = [\"claude\", \"-p\"]\noneshot = true\ninstruction_args = [\"--append-system-prompt\", \"{instruction}\"]\n",
+        )
+        .unwrap();
+        let err = load(&config_path).unwrap_err();
+        assert!(err.to_string().contains("oneshot"), "{err}");
     }
 
     #[test]

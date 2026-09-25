@@ -57,6 +57,7 @@ default_workspace = "myapp"
 | `agents.<name>.command` | 文字列配列（argv） | 必須 | 空配列、または先頭（プログラム名）が空文字列なら設定エラー |
 | `agents.<name>.instruction_args` | 文字列配列 | 無し | instruction を渡す引数。各要素の `{instruction}` を instruction に置き換える。どの要素にも `{instruction}` が無ければ設定エラー。無ければ instruction はタスク本文に連結される |
 | `agents.<name>.shell` | 真偽値 | true | true ならユーザーの対話シェル経由で起動する（[下記](#シェル経由の起動)） |
+| `agents.<name>.oneshot` | 真偽値 | false | true なら instruction を渡さず、agent の終了コードでタスクの結果を決める（[runner.md](runner.md#終了後の分岐)）。`instruction_args` と同時に指定すると設定エラー |
 | `agents.<name>.env` | 文字列→文字列のテーブル | 空 | agent に渡す環境変数。キーは空文字列・`=` や NUL を含むもの・`ZELLOOM_` で始まるものが設定エラー、値は NUL を含むと設定エラー（`config::validate_env`） |
 | `workspaces.<id>` | テーブル | — | `<id>`（workspace ID）は空文字列・空白や制御文字や `:` を含むものが設定エラー（`config::validate_workspace_id`） |
 | `workspaces.<id>.path` | パス | 必須 | 存在確認はしない |
@@ -91,6 +92,7 @@ When the user explicitly confirms that the current task is finished, run:
 
 argv の組み立て（`build_argv`）:
 
+- `oneshot` の agent: `command + [task.text]`。instruction は渡さない。例: `command = ["claude", "-p"]` なら `["claude", "-p", task.text]`
 - `instruction_args` がある agent: `command + instruction_args（各要素の {instruction} を置換）+ [task.text]`。例: `claude` は `["claude", "--append-system-prompt", instruction, task.text]`、`codex` は `["codex", "-c", "developer_instructions=<instruction>", task.text]`（`-c` の値は TOML として解釈できなければ生の文字列として扱われ、developer ロールのメッセージになる）
 - 無い agent: `command + ["{instruction}\n{task.text}"]`（instruction と本文を改行区切りで1引数に連結）
 

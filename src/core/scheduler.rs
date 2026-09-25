@@ -93,6 +93,10 @@ fn build_instruction(loom_exe: &str) -> String {
 
 fn build_argv(agent_cfg: &AgentConfig, instruction: &str, text: &str) -> Vec<String> {
     let mut argv = agent_cfg.command.clone();
+    if agent_cfg.oneshot {
+        argv.push(text.to_string());
+        return argv;
+    }
     match &agent_cfg.instruction_args {
         Some(args) => {
             argv.extend(
@@ -177,6 +181,7 @@ impl Scheduler {
             cwd: ws.path.to_string_lossy().into_owned(),
             env,
             shell: agent_cfg.shell,
+            oneshot: agent_cfg.oneshot,
         }
     }
 
@@ -913,6 +918,7 @@ mod tests {
             command: vec!["a".into()],
             instruction_args: None,
             shell: true,
+            oneshot: false,
             env: map(&[
                 ("ONLY_AGENT", "agent"),
                 ("BOTH", "agent"),
@@ -948,6 +954,7 @@ mod tests {
                 "developer_instructions={instruction}".into(),
             ]),
             shell: true,
+            oneshot: false,
             env: BTreeMap::new(),
         };
         assert_eq!(
@@ -958,6 +965,21 @@ mod tests {
                 "developer_instructions=be nice\n".to_string(),
                 "fix it".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn oneshot_passes_only_task_text() {
+        let agent = AgentConfig {
+            command: vec!["claude".into(), "-p".into()],
+            instruction_args: None,
+            shell: true,
+            oneshot: true,
+            env: BTreeMap::new(),
+        };
+        assert_eq!(
+            build_argv(&agent, "be nice\n", "fix it"),
+            vec!["claude".to_string(), "-p".to_string(), "fix it".to_string()]
         );
     }
 }

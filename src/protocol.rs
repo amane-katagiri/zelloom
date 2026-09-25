@@ -209,6 +209,7 @@ pub struct ResolvedAgent {
     pub cwd: String,
     pub env: BTreeMap<String, String>,
     pub shell: bool,
+    pub oneshot: bool,
 }
 
 // Rare, small-volume IPC messages, not a hot path, so we accept the size difference instead of boxing `Task`/`ResolvedAgent`.

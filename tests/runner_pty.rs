@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use zelloom::client::call;
 use zelloom::core::{CoreOptions, NoopLauncher, run as core_run};
-use zelloom::protocol::{Request, Source};
+use zelloom::protocol::{Request, Source, Task, TaskStatus};
 
 const TASK_TEXT: &str =
     "fix \"quotes\" and 'single' $HOME `x` $(echo no)\n二行目 * ; exec \"$@\" \\";
@@ -92,6 +92,11 @@ command = [{command:?}, "--flag"]
 instruction_args = ["--append-system-prompt", "{{instruction}}"]
 shell = {shell_enabled}
 env = {{ FAKE_OUT = {out:?}, AGENT_ONLY = "agent", BOTH = "agent", LITERAL = "$HOME x", RC_OVERRIDE = "config" }}
+
+[agents.oneshot]
+command = ["/bin/sh", "-c", "exit \"$0\""]
+shell = {shell_enabled}
+oneshot = true
 
 [workspaces.a]
 path = {workspace:?}
@@ -190,12 +195,16 @@ env = {{ BOTH = "workspace" }}
     }
 
     fn enqueue(&self) -> String {
+        self.enqueue_with(TASK_TEXT, None)
+    }
+
+    fn enqueue_with(&self, text: &str, agent: Option<&str>) -> String {
         let task = call(
             &self.socket,
             &Request::Enqueue {
-                text: TASK_TEXT.to_string(),
+                text: text.to_string(),
                 workspace: "a".to_string(),
-                agent: None,
+                agent: agent.map(str::to_string),
                 source: Source::cli(),
                 reply_to: None,
                 metadata: serde_json::json!({}),
@@ -247,6 +256,18 @@ env = {{ BOTH = "workspace" }}
             env,
             cwd: cwd.trim_end().to_string(),
         }
+    }
+
+    fn wait_status(&self, task_id: &str, status: TaskStatus) {
+        wait_until(
+            &format!("{task_id} to become {status:?}"),
+            Duration::from_secs(15),
+            || {
+                let tasks: Vec<Task> =
+                    serde_json::from_value(call(&self.socket, &Request::List).unwrap()).unwrap();
+                tasks.iter().any(|t| t.id == task_id && t.status == status)
+            },
+        );
     }
 
     fn loom_done(&self, env: &BTreeMap<String, String>) {
@@ -463,4 +484,22 @@ fn fish_agent_runs_through_interactive_shell() {
 #[test]
 fn shell_false_runs_agent_directly() {
     run_scenario(&find_program("bash").unwrap(), false, false);
+}
+
+fn run_oneshot_scenario(shell: &Path, shell_enabled: bool) {
+    let mut harness = Harness::new(shell_enabled);
+    harness.start_runner(shell);
+
+    let succeeded = harness.enqueue_with("0", Some("oneshot"));
+    let failed = harness.enqueue_with("3", Some("oneshot"));
+    harness.wait_status(&succeeded, TaskStatus::Done);
+    harness.wait_status(&failed, TaskStatus::Failed);
+    assert!(!harness.pty_text().contains("exited on its own"));
+    harness.finish();
+}
+
+#[test]
+fn oneshot_agent_exit_status_decides_outcome() {
+    run_oneshot_scenario(&find_program("bash").unwrap(), true);
+    run_oneshot_scenario(&find_program("bash").unwrap(), false);
 }

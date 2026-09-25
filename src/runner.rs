@@ -385,12 +385,16 @@ fn run_task(
         return false;
     }
 
-    let prompt = match prompt_outcome(&tty, &task.id, rx) {
-        Ok(prompt) => prompt,
-        Err(e) => {
-            eprintln!("[zelloom-runner] failed to ask for the task outcome: {e:#}");
-            report_failed(writer, &task.id);
-            return true;
+    let prompt = if agent.oneshot {
+        PromptResult::Outcome(oneshot_outcome(&exit_status))
+    } else {
+        match prompt_outcome(&tty, &task.id, rx) {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                eprintln!("[zelloom-runner] failed to ask for the task outcome: {e:#}");
+                report_failed(writer, &task.id);
+                return true;
+            }
         }
     };
     match prompt {
@@ -498,6 +502,13 @@ fn wait_for_agent(
     (exit_status, stop_requested, server_closed, term_signal)
 }
 
+fn oneshot_outcome(exit_status: &std::io::Result<ExitStatus>) -> Outcome {
+    match exit_status {
+        Ok(status) if status.success() => Outcome::Done,
+        _ => Outcome::Failed,
+    }
+}
+
 enum PromptResult {
     Outcome(Outcome),
     Cancelled,
@@ -603,6 +614,7 @@ mod tests {
             cwd: "/".to_string(),
             env: BTreeMap::new(),
             shell: false,
+            oneshot: false,
         };
         let keep_running = run_task(task("t1"), agent, &mut writer, &mut rx, &tx);
         let mut line = String::new();
@@ -708,6 +720,7 @@ mod tests {
             cwd: "/".to_string(),
             env: BTreeMap::new(),
             shell: false,
+            oneshot: false,
         };
         assert_eq!(
             strings(&command_argv(&agent, Some(OsStr::new("/bin/bash"))).unwrap()),
