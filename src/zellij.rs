@@ -15,6 +15,8 @@ pub enum ZellijError {
     },
     #[error("failed to parse zellij output: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("unexpected zellij output: {0:?}")]
+    UnexpectedOutput(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,7 +90,7 @@ impl Zellij {
         Ok(serde_json::from_str(&out)?)
     }
 
-    pub fn new_tab(&self, name: &str, cwd: &Path, argv: &[String]) -> Result<(), ZellijError> {
+    pub fn new_tab(&self, name: &str, cwd: &Path, argv: &[String]) -> Result<u32, ZellijError> {
         let mut args: Vec<String> = vec![
             "action".to_string(),
             "new-tab".to_string(),
@@ -101,7 +103,25 @@ impl Zellij {
         ];
         args.extend(argv.iter().cloned());
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(&args_ref)?;
+        let out = self.run(&args_ref)?;
+        out.trim()
+            .parse()
+            .map_err(|_| ZellijError::UnexpectedOutput(out.clone()))
+    }
+
+    pub fn move_tab_left(&self, tab_id: u32) -> Result<(), ZellijError> {
+        self.run(&[
+            "action",
+            "move-tab",
+            "--tab-id",
+            &tab_id.to_string(),
+            "left",
+        ])?;
+        Ok(())
+    }
+
+    pub fn close_pane(&self, pane_id: &str) -> Result<(), ZellijError> {
+        self.run(&["action", "close-pane", "--pane-id", pane_id])?;
         Ok(())
     }
 

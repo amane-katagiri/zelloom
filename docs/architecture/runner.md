@@ -73,4 +73,4 @@ agent exited on its own. [d]one / [r]estart / [f]ailed?
 - 待機中に切断されたら `connection to loom core lost` を表示して終了する。
 - agent 実行中に切断されても agent は止めない。agent が終わった時点で runner も終了する。
 - core 側では、切断した runner が実行中だったタスクは `interrupted` になる（[scheduler.md](scheduler.md#runner-の管理)）。
-- runner が終了するとペインは exited 状態になる。次にその workspace でタスクを開始するとき、launcher がタブを閉じて作り直す（[zellij.md](zellij.md#workspace-タブの再利用と作り直し)）。
+- core が起動した runner（`--close-pane-on-exit` 付き）は、正常終了するとき自分のペインを閉じる（[zellij.md](zellij.md#runner-の-argv)）。エラーで終了した場合や、フラグ無しで起動した runner が終了した場合はペインが exited 状態で残る。次にその workspace でタスクを開始するとき、launcher がタブを閉じて作り直す（[zellij.md](zellij.md#workspace-タブの再利用と作り直し)）。

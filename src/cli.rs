@@ -31,6 +31,9 @@ pub enum Command {
     /// Run the runner for a workspace (normally started by core in a Zellij tab)
     #[command(hide = true)]
     Runner {
+        /// Close this Zellij pane when the runner exits successfully
+        #[arg(long)]
+        close_pane_on_exit: bool,
         /// Workspace id to serve
         workspace: String,
     },
@@ -102,8 +105,15 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         None => run_bare_loom().await,
         Some(Command::Core) => run_core().await,
-        Some(Command::Runner { workspace }) => {
-            tokio::task::spawn_blocking(move || crate::runner::run(workspace)).await?
+        Some(Command::Runner {
+            close_pane_on_exit,
+            workspace,
+        }) => {
+            tokio::task::spawn_blocking(move || crate::runner::run(workspace)).await??;
+            if close_pane_on_exit {
+                crate::runner::close_own_pane();
+            }
+            Ok(())
         }
         Some(Command::Add {
             workspace,

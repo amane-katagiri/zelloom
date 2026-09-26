@@ -145,6 +145,18 @@ pub fn run(workspace: String) -> anyhow::Result<()> {
     }
 }
 
+pub fn close_own_pane() {
+    let (Ok(session), Ok(pane_id)) = (
+        std::env::var("ZELLIJ_SESSION_NAME"),
+        std::env::var("ZELLIJ_PANE_ID"),
+    ) else {
+        return;
+    };
+    if let Err(e) = crate::zellij::Zellij::new(session).close_pane(&format!("terminal_{pane_id}")) {
+        eprintln!("[zelloom-runner] failed to close the pane: {e}");
+    }
+}
+
 fn ignore_job_control_signals() -> anyhow::Result<()> {
     for sig in [
         Signal::SIGTTOU,

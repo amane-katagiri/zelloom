@@ -30,9 +30,13 @@ pub fn log_dir() -> PathBuf {
 }
 
 pub fn socket_path() -> PathBuf {
-    if let Some(p) = SOCKET_OVERRIDE.get() {
-        return p.clone();
+    match SOCKET_OVERRIDE.get() {
+        Some(p) => p.clone(),
+        None => default_socket_path(),
     }
+}
+
+pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("ZELLOOM_SOCKET") {
         return PathBuf::from(p);
     }

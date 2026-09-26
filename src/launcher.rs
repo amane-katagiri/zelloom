@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::TabLauncher;
-use crate::zellij::{PaneInfo, TabInfo, Zellij};
+use crate::zellij::{PaneInfo, TabInfo, Zellij, ZellijError};
 
 pub struct ZellijLauncher {
     session_name: Option<String>,
@@ -24,15 +24,103 @@ enum LaunchDecision {
     AlreadyRunning,
 }
 
-fn is_runner_command(command: &str, exe_name: &str, workspace_id: &str) -> bool {
-    let Some(prefix) = command.strip_suffix(&format!(" runner {workspace_id}")) else {
-        return false;
-    };
-    let exe = match prefix.find(" --socket ") {
-        Some(idx) => &prefix[..idx],
-        None => prefix,
-    };
+struct Sockets<'a> {
+    own: &'a Path,
+    default: &'a Path,
+}
+
+pub const CLOSE_PANE_FLAG: &str = "--close-pane-on-exit";
+
+fn is_loom_exe(exe: &str, exe_name: &str) -> bool {
     Path::new(exe.trim()).file_name().and_then(|n| n.to_str()) == Some(exe_name)
+}
+
+fn split_socket(prefix: &str) -> (&str, Option<&str>) {
+    match prefix.split_once(" --socket ") {
+        Some((exe, socket)) => (exe, Some(socket)),
+        None => (prefix, None),
+    }
+}
+
+impl Sockets<'_> {
+    fn is_own(&self, socket: Option<&str>) -> bool {
+        match socket {
+            Some(socket) => Path::new(socket) == self.own,
+            None => self.own == self.default,
+        }
+    }
+}
+
+fn parse_runner_command<'a>(
+    command: &'a str,
+    exe_name: &str,
+) -> Option<(Option<&'a str>, &'a str)> {
+    let (prefix, workspace) = command.rsplit_once(' ')?;
+    let prefix = prefix
+        .strip_suffix(&format!(" {CLOSE_PANE_FLAG}"))
+        .unwrap_or(prefix);
+    let (exe, socket) = split_socket(prefix.strip_suffix(" runner")?);
+    is_loom_exe(exe, exe_name).then_some((socket, workspace))
+}
+
+fn is_runner_command(command: &str, exe_name: &str, workspace_id: &str) -> bool {
+    parse_runner_command(command, exe_name).is_some_and(|(_, ws)| ws == workspace_id)
+}
+
+fn is_own_runner_command(command: &str, exe_name: &str, sockets: &Sockets) -> bool {
+    parse_runner_command(command, exe_name).is_some_and(|(socket, _)| sockets.is_own(socket))
+}
+
+fn is_tui_command(command: &str, exe_name: &str, sockets: &Sockets) -> bool {
+    let (exe, socket) = split_socket(command);
+    is_loom_exe(exe, exe_name) && sockets.is_own(socket)
+}
+
+fn pane_commands(pane: &PaneInfo) -> impl Iterator<Item = &str> {
+    [
+        pane.terminal_command.as_deref(),
+        pane.pane_command.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+}
+
+fn tab_has_pane(panes: &[PaneInfo], tab_id: u32, pred: impl Fn(&str) -> bool) -> bool {
+    panes
+        .iter()
+        .filter(|p| p.tab_id == tab_id && !p.is_plugin)
+        .any(|p| pane_commands(p).any(&pred))
+}
+
+fn left_moves(
+    tabs: &[TabInfo],
+    panes: &[PaneInfo],
+    new_tab_id: u32,
+    exe_name: &str,
+    sockets: &Sockets,
+) -> usize {
+    let mut order: Vec<&TabInfo> = tabs.iter().collect();
+    order.sort_by_key(|t| t.position);
+    let Some(new_idx) = order.iter().position(|t| t.tab_id == new_tab_id) else {
+        return 0;
+    };
+    let Some(tui_idx) = order.iter().position(|t| {
+        t.tab_id != new_tab_id
+            && tab_has_pane(panes, t.tab_id, |c| is_tui_command(c, exe_name, sockets))
+    }) else {
+        return 0;
+    };
+    let mut target = tui_idx + 1;
+    while target < order.len()
+        && order[target].tab_id != new_tab_id
+        && tab_has_pane(panes, order[target].tab_id, |c| {
+            is_own_runner_command(c, exe_name, sockets)
+        })
+    {
+        target += 1;
+    }
+    new_idx.saturating_sub(target)
 }
 
 fn decide(
@@ -46,12 +134,7 @@ fn decide(
         let runner_panes: Vec<&PaneInfo> = panes
             .iter()
             .filter(|p| p.tab_id == tab.tab_id && !p.is_plugin)
-            .filter(|p| {
-                [p.terminal_command.as_deref(), p.pane_command.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|c| is_runner_command(c.trim(), exe_name, workspace_id))
-            })
+            .filter(|p| pane_commands(p).any(|c| is_runner_command(c, exe_name, workspace_id)))
             .collect();
         if runner_panes.iter().any(|p| !p.exited) {
             return LaunchDecision::AlreadyRunning;
@@ -75,6 +158,20 @@ fn exe_file_name(exe: &Path) -> String {
     name.trim_end_matches(" (deleted)").to_string()
 }
 
+fn place_next_to_tui(
+    zellij: &Zellij,
+    panes: &[PaneInfo],
+    tab_id: u32,
+    exe_name: &str,
+    sockets: &Sockets,
+) -> Result<(), ZellijError> {
+    let tabs = zellij.list_tabs()?;
+    for _ in 0..left_moves(&tabs, panes, tab_id, exe_name, sockets) {
+        zellij.move_tab_left(tab_id)?;
+    }
+    Ok(())
+}
+
 impl TabLauncher for ZellijLauncher {
     fn launch(&self, workspace_id: &str, workspace_path: &Path) -> anyhow::Result<()> {
         let Some(session) = &self.session_name else {
@@ -85,10 +182,11 @@ impl TabLauncher for ZellijLauncher {
         let zellij = Zellij::new(session.clone());
 
         let exe_path = std::env::current_exe()?;
+        let exe_name = exe_file_name(&exe_path);
         let tabs = zellij.list_tabs()?;
         let panes = zellij.list_panes()?;
 
-        match decide(&tabs, &panes, workspace_id, &exe_file_name(&exe_path)) {
+        match decide(&tabs, &panes, workspace_id, &exe_name) {
             LaunchDecision::AlreadyRunning => return Ok(()),
             LaunchDecision::CloseThenCreate(tab_ids) => {
                 for tab_id in tab_ids {
@@ -103,9 +201,18 @@ impl TabLauncher for ZellijLauncher {
             "--socket".to_string(),
             self.socket_path.to_string_lossy().into_owned(),
             "runner".to_string(),
+            CLOSE_PANE_FLAG.to_string(),
             workspace_id.to_string(),
         ];
-        zellij.new_tab(workspace_id, workspace_path, &argv)?;
+        let tab_id = zellij.new_tab(workspace_id, workspace_path, &argv)?;
+        let default_socket = crate::paths::default_socket_path();
+        let sockets = Sockets {
+            own: &self.socket_path,
+            default: &default_socket,
+        };
+        if let Err(e) = place_next_to_tui(&zellij, &panes, tab_id, &exe_name, &sockets) {
+            eprintln!("[zelloom-core] failed to move tab '{workspace_id}' next to the TUI: {e}");
+        }
         Ok(())
     }
 }
@@ -294,5 +401,154 @@ mod tests {
     fn exe_file_name_strips_deleted_suffix() {
         assert_eq!(exe_file_name(Path::new("/usr/bin/loom (deleted)")), "loom");
         assert_eq!(exe_file_name(Path::new("/usr/bin/loom")), "loom");
+    }
+
+    #[test]
+    fn runner_command_matching_accepts_close_pane_flag() {
+        assert!(is_runner_command(
+            "/opt/bin/loom --socket /tmp/s.sock runner --close-pane-on-exit ws",
+            "loom",
+            "ws"
+        ));
+        assert!(!is_runner_command(
+            "/opt/bin/loom runner --other-flag ws",
+            "loom",
+            "ws"
+        ));
+    }
+
+    #[test]
+    fn tui_command_matching() {
+        let sockets = Sockets {
+            own: Path::new("/tmp/a b.sock"),
+            default: Path::new("/tmp/a b.sock"),
+        };
+        assert!(is_tui_command("/opt/bin/loom", "loom", &sockets));
+        assert!(is_tui_command(
+            "loom --socket /tmp/a b.sock",
+            "loom",
+            &sockets
+        ));
+        assert!(!is_tui_command(
+            "loom --socket /tmp/other.sock",
+            "loom",
+            &sockets
+        ));
+        assert!(!is_tui_command("loom list", "loom", &sockets));
+        assert!(!is_tui_command("/opt/bin/loom runner ws", "loom", &sockets));
+        assert!(!is_tui_command("/opt/bin/notloom", "loom", &sockets));
+    }
+
+    #[test]
+    fn bare_tui_command_matches_only_when_core_uses_default_socket() {
+        let sockets = Sockets {
+            own: Path::new("/tmp/custom.sock"),
+            default: Path::new("/tmp/default.sock"),
+        };
+        assert!(!is_tui_command("/opt/bin/loom", "loom", &sockets));
+        assert!(is_tui_command(
+            "/opt/bin/loom --socket /tmp/custom.sock",
+            "loom",
+            &sockets
+        ));
+    }
+
+    fn tui_pane(tab_id: u32) -> PaneInfo {
+        let mut p = pane(tab_id, Some("/bin/bash"), false);
+        p.pane_command = Some("loom".to_string());
+        p
+    }
+
+    fn other_runner_pane(tab_id: u32, workspace: &str) -> PaneInfo {
+        pane(
+            tab_id,
+            Some(&format!(
+                "/usr/local/bin/loom --socket /tmp/s.sock runner --close-pane-on-exit {workspace}"
+            )),
+            false,
+        )
+    }
+
+    fn moves(tabs: &[TabInfo], panes: &[PaneInfo], new_tab_id: u32) -> usize {
+        let sockets = Sockets {
+            own: Path::new("/tmp/s.sock"),
+            default: Path::new("/tmp/s.sock"),
+        };
+        left_moves(tabs, panes, new_tab_id, "loom", &sockets)
+    }
+
+    #[test]
+    fn new_tab_moves_right_after_tui_tab() {
+        let tabs = vec![
+            tab(0, "a"),
+            tab(1, "loom"),
+            tab(2, "b"),
+            tab(3, "c"),
+            tab(4, "ws"),
+        ];
+        let panes = vec![tui_pane(1)];
+        assert_eq!(moves(&tabs, &panes, 4), 2);
+    }
+
+    #[test]
+    fn new_tab_goes_after_runner_tabs_next_to_tui() {
+        let tabs = vec![
+            tab(0, "loom"),
+            tab(1, "x"),
+            tab(2, "y"),
+            tab(3, "user"),
+            tab(4, "z"),
+            tab(5, "ws"),
+        ];
+        let panes = vec![
+            tui_pane(0),
+            other_runner_pane(1, "x"),
+            other_runner_pane(2, "y"),
+            other_runner_pane(4, "z"),
+        ];
+        assert_eq!(moves(&tabs, &panes, 5), 2);
+    }
+
+    #[test]
+    fn runner_tab_of_another_core_does_not_extend_the_group() {
+        let tabs = vec![tab(0, "loom"), tab(1, "x"), tab(2, "ws")];
+        let panes = vec![
+            tui_pane(0),
+            pane(
+                1,
+                Some("/usr/local/bin/loom --socket /tmp/other.sock runner x"),
+                false,
+            ),
+        ];
+        assert_eq!(moves(&tabs, &panes, 2), 1);
+    }
+
+    #[test]
+    fn new_tab_stays_when_already_in_place_or_no_tui() {
+        let tabs = vec![tab(0, "a"), tab(1, "loom"), tab(2, "ws")];
+        assert_eq!(moves(&tabs, &[tui_pane(1)], 2), 0);
+        assert_eq!(moves(&tabs, &[], 2), 0);
+    }
+
+    #[test]
+    fn tab_order_follows_position_not_id() {
+        let tabs = vec![
+            TabInfo {
+                tab_id: 7,
+                name: "loom".to_string(),
+                position: 0,
+            },
+            TabInfo {
+                tab_id: 2,
+                name: "b".to_string(),
+                position: 1,
+            },
+            TabInfo {
+                tab_id: 5,
+                name: "ws".to_string(),
+                position: 2,
+            },
+        ];
+        assert_eq!(moves(&tabs, &[tui_pane(7)], 5), 1);
     }
 }

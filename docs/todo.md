@@ -22,7 +22,7 @@
 
 - タスク単位の agent override が TUI に無い。CLI の `loom add --agent` は対応済みで、設定・プロトコル・スケジューラ側も `Task.agent` を扱えるが、TUI の追加操作（`Action::Enqueue`）は常に `agent: None` を送っており、入力欄に agent を指定する手段が無い。
 - Zellij のタブ名に実行中を示す `●` 等のインジケータを付ける機能が無い。
-- クライアント（実際にアタッチしている端末）が1つも無い Zellij セッションでは、`list-tabs` はタブを返すが `list-panes` がペインを1件も返さない、という実機での挙動が確認されている。この状態では `ZellijLauncher::decide` が runner ペインを見つけられず、終了済み runner のタブを閉じずに新しいタブを作るので、同名のタブが溜まりうる。また runner ペインの判定に使う `terminal_command` / `pane_command` の形式（空白区切りの argv）は Zellij 0.45 のソースで確認しただけで、実機の出力では未検証（[architecture/zellij.md](architecture/zellij.md) 参照）。
+- クライアント（実際にアタッチしている端末）が1つも無い Zellij セッションでは、`list-tabs` はタブを返すが `list-panes` がペインを1件も返さない、という実機での挙動が確認されている。この状態では `ZellijLauncher::decide` が runner ペインを見つけられず、終了済み runner のタブを閉じずに新しいタブを作るので、同名のタブが溜まりうる。新しいタブの管理タブ隣への移動、runner の正常終了時のペインクローズもこの状態では効かない（[architecture/zellij.md](architecture/zellij.md) 参照）。
 - TUI の一覧に長いリストのスクロールが無い。`ratatui::widgets::List` を `ListState`/オフセット無しで描画しているため、セクションの高さを超えるタスクは画面から溢れて見えなくなる。
 - TUI から `done` / `cancelled` / `rejected` のタスクを見る手段、`cancelled` のタスクを retry する手段が無い（見出しに `done` / `cancelled` の全期間の件数が出るだけ）。
 - HTTP アダプタ（[http.md](architecture/http.md)）に認証・トークンが無く、`http.listen` が loopback であることでしか守られていない。非 loopback に公開したい場合に備えて何らかのトークン機構が要る。

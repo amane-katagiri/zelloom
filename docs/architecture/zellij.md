@@ -8,7 +8,9 @@
 |---|---|---|
 | `zellij --session <name> action list-tabs -a -j` | 既存タブの一覧を JSON で取得（`tab_id` / `name` / `position`） | `Zellij::list_tabs` |
 | `zellij --session <name> action list-panes -a -j` | 全ペインの一覧を JSON で取得（`tab_id` / `is_plugin` / `exited` / `exit_status` / `terminal_command` / `pane_command` / `pane_cwd` など） | `Zellij::list_panes` |
-| `zellij --session <name> action new-tab --name <name> --cwd <path> --no-focus -- <argv...>` | workspace 用タブを作り、その中で `loom runner ...` を起動する | `Zellij::new_tab` |
+| `zellij --session <name> action new-tab --name <name> --cwd <path> --no-focus -- <argv...>` | workspace 用タブを作り、その中で `loom runner ...` を起動する。標準出力に出る新しいタブの ID を返す | `Zellij::new_tab` |
+| `zellij --session <name> action move-tab --tab-id <id> left` | 作ったタブを管理タブの隣へ寄せる（1 回で 1 つ左へ） | `Zellij::move_tab_left` |
+| `zellij --session <name> action close-pane --pane-id terminal_<id>` | runner が正常終了するとき自分のペインを閉じる | `Zellij::close_pane`（`runner::close_own_pane`） |
 | `zellij --session <name> action go-to-tab-name <name>` | 名前でタブへフォーカス移動 | TUI の `Enter`（`src/tui/mod.rs` が直接実行） |
 | `zellij --session <name> action close-tab-by-id <id>` | 終了済み runner のタブを閉じる（その後に新しいタブを作る） | `ZellijLauncher::launch` |
 
@@ -23,8 +25,10 @@ workspace タブは常にフォーカスを奪わずに作成する（`Zellij::n
 `zellij action new-tab -- <argv>` で起動したペインのプロセスは、core ではなく Zellij サーバプロセスの環境を継承する。ソケットパスは環境変数ではなく `loom` のグローバル `--socket` フラグとして argv で渡す。`ZellijLauncher::launch` は次の argv を組み立てる。
 
 ```text
-<loom の実行ファイルの絶対パス> --socket <socket_path> runner <workspace_id>
+<loom の実行ファイルの絶対パス> --socket <socket_path> runner --close-pane-on-exit <workspace_id>
 ```
+
+`--close-pane-on-exit`（`launcher::CLOSE_PANE_FLAG`。`--help` には出ない runner 用の隠しフラグ）を付けた runner は、正常終了（終了コード 0）するとき `ZELLIJ_SESSION_NAME` と `ZELLIJ_PANE_ID` から自分のペインを特定して閉じる。タブのペインは runner だけなので、タブごと消える。エラーで終了した場合は閉じないので、ペインは終了コードとエラー表示を残したまま exited 状態で残る。フラグの無い runner（シェルから手で起動したものなど）はペインを閉じない。
 
 詳細は [config.md](config.md#パスと環境変数)。
 
@@ -35,10 +39,10 @@ core が `ZELLIJ_SESSION_NAME` なしで起動されていると、`ZellijLaunch
 runner タブは、名前が workspace ID に一致し、かつ **runner ペイン** を含むタブ。runner ペインは、プラグインでない（`is_plugin` が false）ペインのうち、`terminal_command`（ペインを起動したコマンド。空白区切りの 1 文字列）か `pane_command`（ペインの現在のフォアグラウンドのコマンド）のどちらかが次の形のもの。
 
 ```text
-<パス>/<core 自身の実行ファイル名> [--socket <path>] runner <workspace_id>
+<パス>/<core 自身の実行ファイル名> [--socket <path>] runner [--close-pane-on-exit] <workspace_id>
 ```
 
-- 末尾が ` runner <workspace_id>` であること、その前の（` --socket ` 以降を除いた）部分のファイル名が core の実行ファイル名（`current_exe()` のファイル名。末尾の ` (deleted)` は除く）と一致することで判定する（`is_runner_command`）。
+- 末尾が ` runner <workspace_id>` か ` runner --close-pane-on-exit <workspace_id>` であること、その前の（` --socket ` 以降を除いた）部分のファイル名が core の実行ファイル名（`current_exe()` のファイル名。末尾の ` (deleted)` は除く）と一致することで判定する（`is_runner_command`）。
 - 同じ名前のタブが複数あってもよい。runner ペインを含まない同名のタブ（ユーザーが自分で作った `loom` タブで TUI を動かしている場合など）は無視する。
 
 分岐:
@@ -47,9 +51,24 @@ runner タブは、名前が workspace ID に一致し、かつ **runner ペイ�
 - runner ペインを含む同名のタブはあるが、その runner ペインがすべて `exited` → `CloseThenCreate`（それらのタブをすべて閉じてから新しく作る）
 - runner ペインを含む同名のタブが無い → `CreateTab`
 
+## 新しいタブの位置
+
+新しく作った runner タブは、`--no-focus` で末尾に作られたあと、管理タブの隣へ移される（`place_next_to_tui`）。
+
+- 管理タブは、プラグインでないペインのうち `terminal_command` か `pane_command` が次の形のものを含むタブ（`is_tui_command`）。複数あれば位置（`position`）が最も左のもの。
+
+  ```text
+  <パス>/<core 自身の実行ファイル名> [--socket <path>]
+  ```
+
+  `--socket` がある場合はそのパスが core 自身のソケットと一致するもの、無い場合は core 自身のソケットが既定のソケット（`ZELLOOM_SOCKET`、無ければ既定パス。`paths::default_socket_path`）と一致するときだけ数える。別の core の TUI は管理タブとみなさない。
+- 移動先は、管理タブの右隣から続く「この core の runner タブ」（ソケットが同じ条件で一致する runner ペインを含むタブ。workspace は問わない）の並びの直後。つまり管理タブの右に、作られた順に runner タブが並ぶ。
+- タブを作ったあと `list_tabs` を取り直して `position` 順に並べ、現在の位置と移動先の差の回数だけ `move-tab --tab-id <id> left` を呼ぶ（`left_moves`）。ペインの情報はタブ作成前に取った `list_panes` の結果を使う。
+- 管理タブが見つからない、またはすでに移動先にある場合は動かさない。移動に失敗してもタブの作成は成功扱いで、`core.log` にエラーを出すだけ。
+
 ### 制約: クライアントがアタッチしていないセッションでの挙動
 
-`list-tabs` / `list-panes` は、そのセッションに Zellij クライアント（実際にアタッチしている端末）が1つも無いと、タブはあってもペインを1件も返さない、という実機での挙動が確認されている。この状態では runner ペインが見つからないので、`decide()` は常に `CreateTab` になり、終了済み runner のタブは閉じられずに残る。`AlreadyRunning` / `CloseThenCreate` の分岐と `terminal_command` / `pane_command` の形式は、ユニットテストの合成データでのみ検証している。詳細は [todo.md](../todo.md)。
+`list-tabs` / `list-panes` は、そのセッションに Zellij クライアント（実際にアタッチしている端末）が1つも無いと、タブはあってもペインを1件も返さない、という実機での挙動が確認されている。この状態では runner ペインが見つからないので、`decide()` は常に `CreateTab` になり、終了済み runner のタブは閉じられずに残る。管理タブも見つからないので、新しいタブは末尾のままになる。runner の `close-pane` もこの状態ではタブを閉じない。詳細は [todo.md](../todo.md)。
 
 ## 素の `loom` 起動フロー
 
