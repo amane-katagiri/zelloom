@@ -268,6 +268,10 @@ impl App {
         }
         match code {
             KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Char('?') | KeyCode::Char('h') => {
+                self.last_message = None;
+                Action::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
                 Action::None
@@ -1172,6 +1176,17 @@ mod tests {
                 text: "one\ntwo\nthree".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn help_keys_clear_the_status_message() {
+        for c in ['?', 'h'] {
+            let mut app = App::new();
+            app.handle_key(key(KeyCode::Char('e')));
+            assert!(app.last_message.is_some());
+            assert_eq!(app.handle_key(key(KeyCode::Char(c))), Action::None);
+            assert!(app.last_message.is_none());
+        }
     }
 
     #[test]

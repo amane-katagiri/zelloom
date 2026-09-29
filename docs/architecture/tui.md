@@ -10,7 +10,7 @@
 - `QUEUED`: `status == queued`（`  workspace text`）
 - `INBOX`: `status == received`（`○ <source の種類>: text`）
 - `INTERRUPTED / FAILED`（`done` / `cancelled` が 1 件以上あればタイトルは `INTERRUPTED / FAILED (total: N done / N cancelled)`）: `status == interrupted` と `status == failed` のタスク一覧（`position` 順）。`failed` は行頭に `✗` を付ける（`✗ workspace text`、`interrupted` は `  workspace text`）。カッコ内は現在ストアに残っている `done` / `cancelled` タスクの全期間の総数で、個々のタスクは表示されない
-- ステータス行: core に到達できないときは `core not running - retrying...`、直近の操作のエラー/結果メッセージがあればそれ、無ければキー一覧
+- ステータス行: core に到達できないときは `core not running - retrying...`、直近の操作のエラー/結果メッセージがあればそれ、無ければキー一覧。メッセージは通常モードで `?` / `h` を押すと消え、キー一覧に戻る
 - 入力行: `> ` に続けてタスク追加/編集の入力バッファ（通常時はプレースホルダ `add task...`）。終了確認モードのときは代わりに確認プロンプト（下記）を表示する
 
 一覧の各行と入力行では、本文中の改行を `⏎` に置き換えて 1 行で表示する（`ui::single_line`）。
@@ -39,6 +39,7 @@
 | 通常 | `R`（`interrupted`/`failed` を選択中） | retry（キュー末尾へ戻す） |
 | 通常 | `D`（`interrupted` を選択中） | 完了扱いにする（`done`） |
 | 通常 | `c`（`queued`/`received`/`interrupted` を選択中） | cancel |
+| 通常 | `?` / `h` | ステータス行のメッセージを消してキー一覧に戻す |
 | 通常 | `q` | 終了確認モードへ（core に到達できないときは即終了） |
 | 通常・入力 | `Ctrl+C` | `q` と同じ（入力モードでは入力を破棄して終了確認モードへ） |
 | 入力 | 文字入力 / `Backspace` / `Delete` / `←` / `→` / `Home` / `End` | 文字単位（マルチバイト対応）でバッファを編集。`Ctrl` か `Alt` を伴う文字キー（`Ctrl+C`・`Ctrl+U` 以外）は無視し、入力しない。`Shift` はそのまま入力する |
