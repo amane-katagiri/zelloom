@@ -59,12 +59,12 @@ zelloom（バイナリ名 `loom`）は、対話型コーディングエージェ
 | `src/launcher.rs` | `TabLauncher` の Zellij 実装（runner ペイン・管理 TUI ペインの判定、タブの再利用・作り直し判定、新しいタブを管理タブの隣へ移す） | [zellij.md](architecture/zellij.md) |
 | `src/http.rs` | HTTP アダプタ（`POST /tasks`、Host/Origin チェック、CORS、core 自身の Unix socket へのクライアント呼び出し） | [http.md](architecture/http.md) |
 | `src/zellij.rs` | `zellij --session <name> action ...` の薄いラッパ | [zellij.md](architecture/zellij.md) |
-| `src/runner.rs` | runner 本体（シェル経由の起動、ジョブ制御、端末復元、停止シーケンス、自発終了時のプロンプト、正常終了時に自分のペインを閉じる） | [runner.md](architecture/runner.md) |
+| `src/runner.rs` | runner 本体（待機中の端末からのタスク入力、シェル経由の起動、ジョブ制御、端末復元、停止シーケンス、自発終了時のプロンプト、正常終了時に自分のペインを閉じる） | [runner.md](architecture/runner.md) |
 | `src/tui/mod.rs` | TUI のイベントループ、core 呼び出し、タブへのフォーカス | [tui.md](architecture/tui.md) |
 | `src/tui/app.rs` | TUI の状態とキー処理 | [tui.md](architecture/tui.md) |
 | `src/tui/ui.rs` | TUI の描画 | [tui.md](architecture/tui.md) |
 | `tests/scheduler_flow.rs` | core を実ソケットで起動し、偽 runner で scheduler の流れを検証する結合テスト（`loom stop` 相当の停止と `cli::ensure_core` も含む） | — |
-| `tests/runner_pty.rs` | pty の上で実際の `loom runner` を動かし、シェル経由の起動・rc ファイル・環境変数・argv・`loom done` による停止を検証する結合テスト（手元に無いシェルは飛ばす） | [runner.md](architecture/runner.md) |
+| `tests/runner_pty.rs` | pty の上で実際の `loom runner` を動かし、シェル経由の起動・rc ファイル・環境変数・argv・`loom done` による停止・待機中の端末からのタスク入力を検証する結合テスト（手元に無いシェルは飛ばす） | [runner.md](architecture/runner.md) |
 | `tests/http_adapter.rs` | core を `[http]` 付きの実ソケットで起動し、生の HTTP/1.1 リクエストで `POST /tasks`・Host/Origin チェック・CORS・core 終了時の停止を検証する結合テスト | [http.md](architecture/http.md) |
 
 ## 設定とパスの要約

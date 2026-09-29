@@ -7,9 +7,20 @@
 1. SIGTTOU / SIGTTIN / SIGINT / SIGQUIT / SIGTSTP を無視にする。
 2. SIGHUP / SIGTERM のハンドラを入れる（self-pipe で内部メッセージに変換する）。
 3. ソケット（`--socket` > `ZELLOOM_SOCKET` > 既定。[config.md](config.md#パスと環境変数)）に接続し、最初のメッセージとして `runner_attach` を送る。`ok` 以外が返る（同じ workspace の runner が既に接続中など）か、応答前に切断されたら、エラーを表示して終了する。応答前に SIGHUP / SIGTERM を受けた場合は何も表示せずに終了する。
-4. `zelloom runner: <workspace> — waiting for tasks` を表示して待つ。
+4. `/dev/tty` を開く。開けたら入力用に保持する。
+5. `zelloom runner: <workspace> — waiting for tasks` を表示して待つ。端末を保持している場合は続けて `type a task and press Enter to queue it for <workspace>` と入力プロンプト `> ` を表示する。
 
 ソケットの読み取り、agent の `wait`、シグナル受信はそれぞれ別スレッドで行い、1 本の `mpsc` チャネルに流す。待機中に届いた `stop` や応答行は捨てる。ただしエラー応答（`agent_exited` が拒否された場合など）は内容を表示してから捨てる。
+
+## 待機中のタスク入力
+
+待機中、runner はチャネルを確認しつつ、保持した端末を 100ms ごとに `poll` して入力を待つ。端末は canonical モードのまま使うので、行編集（Backspace、Ctrl-U、Ctrl-C で行を破棄など）は端末ドライバに任せ、Enter で確定した 1 行を 1 タスクとして扱う。
+
+- 前後の空白を除いた行が空でなければ、別の接続で `enqueue`（`workspace` はこの runner の workspace、`agent` なし、`source` は `{"type": "runner"}`）を送り、`added <id> (<status>)` を表示する。失敗したらエラーを表示する。どちらの場合も次のプロンプトを出す。
+- 複数行を貼り付けると、行ごとに別のタスクになる。1 行はカーネルの canonical モードの上限（4095 バイト）を超えられない。
+- `sources.runner.auto_queue`（[config.md](config.md)）は他の source と同じく効く。
+- `poll` が失敗した、端末が読めなくなった（`POLLHUP` など）、`read` が失敗した場合はエラーを表示し、以後は入力を受け付けずチャネルだけを待つ。
+- `start` を受けたら、agent を起動する前に端末の未読入力を `tcflush(TCIFLUSH)` で捨てる。確定前の入力が agent に渡らないようにするため。
 
 ## タスクの実行
 

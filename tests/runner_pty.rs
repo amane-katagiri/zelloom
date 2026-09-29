@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,7 @@ struct Harness {
     core: Option<std::thread::JoinHandle<()>>,
     runner: Option<Child>,
     pty_output: Arc<Mutex<Vec<u8>>>,
+    pty_input: Option<std::fs::File>,
     agent_pids: Vec<i32>,
 }
 
@@ -139,6 +140,7 @@ env = {{ BOTH = "workspace" }}
             core: Some(core),
             runner: None,
             pty_output: Arc::new(Mutex::new(Vec::new())),
+            pty_input: None,
             agent_pids: Vec::new(),
         }
     }
@@ -175,6 +177,7 @@ env = {{ BOTH = "workspace" }}
 
         let output = self.pty_output.clone();
         let mut master = std::fs::File::from(pty.master);
+        self.pty_input = Some(master.try_clone().unwrap());
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = master.read(&mut buf) {
@@ -188,6 +191,16 @@ env = {{ BOTH = "workspace" }}
         wait_until("runner banner", Duration::from_secs(10), || {
             String::from_utf8_lossy(&self.pty_output.lock().unwrap()).contains("waiting for tasks")
         });
+    }
+
+    fn type_line(&self, line: &str) {
+        let mut input = self.pty_input.as_ref().unwrap();
+        input.write_all(line.as_bytes()).unwrap();
+        input.write_all(b"\n").unwrap();
+    }
+
+    fn list(&self) -> Vec<Task> {
+        serde_json::from_value(call(&self.socket, &Request::List).unwrap()).unwrap()
     }
 
     fn pty_text(&self) -> String {
@@ -502,4 +515,46 @@ fn run_oneshot_scenario(shell: &Path, shell_enabled: bool) {
 fn oneshot_agent_exit_status_decides_outcome() {
     run_oneshot_scenario(&find_program("bash").unwrap(), true);
     run_oneshot_scenario(&find_program("bash").unwrap(), false);
+}
+
+#[test]
+fn idle_runner_queues_typed_lines_for_its_workspace() {
+    let mut harness = Harness::new(false);
+    harness.start_runner(&find_program("bash").unwrap());
+
+    harness.type_line("   ");
+    harness.type_line("タスク from the pane");
+    wait_until("typed task to be queued", Duration::from_secs(10), || {
+        harness
+            .list()
+            .iter()
+            .any(|t| t.text == "タスク from the pane")
+    });
+    let tasks = harness.list();
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.workspace, "a");
+    assert_eq!(task.source.kind, "runner");
+
+    let agent = harness.wait_agent(&task.id);
+    assert_eq!(agent.args[3], "タスク from the pane");
+    harness.loom_done(&agent.env);
+    harness.wait_status(&task.id, TaskStatus::Done);
+    wait_until("runner to go idle", Duration::from_secs(10), || {
+        harness.pty_text().matches("waiting for tasks").count() >= 2
+    });
+
+    harness.type_line("second");
+    wait_until("second task to be queued", Duration::from_secs(10), || {
+        harness.list().iter().any(|t| t.text == "second")
+    });
+    let second = harness
+        .list()
+        .into_iter()
+        .find(|t| t.text == "second")
+        .unwrap();
+    let agent = harness.wait_agent(&second.id);
+    harness.loom_done(&agent.env);
+    harness.wait_status(&second.id, TaskStatus::Done);
+    harness.finish();
 }

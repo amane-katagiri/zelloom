@@ -15,7 +15,7 @@ use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd::{self, Pid};
 
-use crate::protocol::{Outcome, Request, ResolvedAgent, RunnerEvent, ServerMessage, Task};
+use crate::protocol::{Outcome, Request, ResolvedAgent, RunnerEvent, ServerMessage, Source, Task};
 
 static TERM_PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -117,13 +117,17 @@ pub fn run(workspace: String) -> anyhow::Result<()> {
         _ => anyhow::bail!("core closed the connection before acking runner_attach"),
     }
 
-    print_idle_banner(&workspace);
+    let mut input = open_tty().ok();
+    print_idle_banner(&workspace, input.is_some());
 
     loop {
-        match rx.recv() {
+        match wait_idle(&mut input, &mut rx, &workspace) {
             Ok(RunnerMsg::Server(ServerMessage::Event(RunnerEvent::Start { task, agent }))) => {
+                if let Some(tty) = &input {
+                    let _ = termios::tcflush(tty, termios::FlushArg::TCIFLUSH);
+                }
                 if run_task(task, agent, &mut writer, &mut rx, &tx) {
-                    print_idle_banner(&workspace);
+                    print_idle_banner(&workspace, input.is_some());
                 } else {
                     return Ok(());
                 }
@@ -235,8 +239,91 @@ fn send_request(writer: &mut UnixStream, request: &Request) -> anyhow::Result<()
     Ok(())
 }
 
-fn print_idle_banner(workspace: &str) {
+fn print_idle_banner(workspace: &str, accepts_input: bool) {
     println!("\nzelloom runner: {workspace} — waiting for tasks\n");
+    if accepts_input {
+        println!("type a task and press Enter to queue it for {workspace}");
+        print_input_prompt();
+    }
+}
+
+fn print_input_prompt() {
+    print!("> ");
+    let _ = std::io::stdout().flush();
+}
+
+// Polls instead of reading the tty on a separate thread, because such a thread would keep reading from the background and steal input once the agent owns the terminal.
+fn wait_idle(
+    input: &mut Option<File>,
+    rx: &mut EventStream,
+    workspace: &str,
+) -> Result<RunnerMsg, mpsc::RecvError> {
+    loop {
+        let Some(tty) = input.as_ref() else {
+            return rx.recv();
+        };
+        match rx.try_recv() {
+            Ok(msg) => return Ok(msg),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match read_input_line(tty) {
+            Ok(Some(line)) => {
+                let text = line.trim();
+                if !text.is_empty() {
+                    enqueue_from_runner(workspace, text);
+                }
+                print_input_prompt();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("\n[zelloom-runner] stopped reading tasks from the terminal: {e}");
+                *input = None;
+            }
+        }
+    }
+}
+
+fn read_input_line(tty: &File) -> anyhow::Result<Option<String>> {
+    let mut fds = [PollFd::new(tty.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::from(100u16)) {
+        Ok(0) | Err(nix::errno::Errno::EINTR) => return Ok(None),
+        Ok(_) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+    if !revents.contains(PollFlags::POLLIN) {
+        anyhow::bail!("terminal is no longer readable ({revents:?})");
+    }
+    let mut buf = [0u8; 4096];
+    match unistd::read(tty, &mut buf) {
+        Ok(n) => Ok(Some(String::from_utf8_lossy(&buf[..n]).into_owned())),
+        Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn enqueue_from_runner(workspace: &str, text: &str) {
+    let request = Request::Enqueue {
+        text: text.to_string(),
+        workspace: workspace.to_string(),
+        agent: None,
+        source: Source {
+            kind: "runner".to_string(),
+            id: None,
+            sender: None,
+        },
+        reply_to: None,
+        metadata: serde_json::json!({}),
+    };
+    match crate::client::call(&crate::paths::socket_path(), &request) {
+        Ok(task) => println!(
+            "added {} ({})",
+            task["id"].as_str().unwrap_or("?"),
+            task["status"].as_str().unwrap_or("?")
+        ),
+        Err(e) => eprintln!("[zelloom-runner] failed to add the task: {e}"),
+    }
 }
 
 fn open_tty() -> anyhow::Result<File> {
