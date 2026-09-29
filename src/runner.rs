@@ -283,7 +283,7 @@ fn wait_idle(
                 } else {
                     match edit_in_foreground(tty) {
                         Ok(Some(text)) => enqueue_from_runner(workspace, &text),
-                        Ok(None) => println!("the editor returned empty text; nothing queued"),
+                        Ok(None) => {}
                         Err(e) => eprintln!("[zelloom-runner] {e:#}"),
                     }
                 }

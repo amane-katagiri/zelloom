@@ -125,6 +125,11 @@ impl Zellij {
         Ok(())
     }
 
+    pub fn go_to_tab_name(&self, name: &str) -> Result<(), ZellijError> {
+        self.run(&["action", "go-to-tab-name", name])?;
+        Ok(())
+    }
+
     pub fn close_tab_by_id(&self, tab_id: u32) -> Result<(), ZellijError> {
         self.run(&["action", "close-tab-by-id", &tab_id.to_string()])?;
         Ok(())

@@ -57,6 +57,8 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let status_text = if !app.core_reachable {
         "core not running - retrying...".to_string()
+    } else if app.editor_armed() {
+        crate::editor::open_hint()
     } else if let Some(msg) = &app.last_message {
         msg.clone()
     } else {

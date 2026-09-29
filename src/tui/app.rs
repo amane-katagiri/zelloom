@@ -105,6 +105,16 @@ impl App {
         }
     }
 
+    pub fn editor_armed(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Input {
+                editor_armed: true,
+                ..
+            }
+        )
+    }
+
     pub fn selectable_tasks(&self) -> Vec<&Task> {
         SECTION_STATUSES
             .iter()
@@ -360,7 +370,6 @@ impl App {
             KeyCode::Enter if buffer.iter().all(|c| c.is_whitespace()) => {
                 if !armed {
                     *editor_armed = true;
-                    self.last_message = Some(crate::editor::open_hint());
                     return Action::None;
                 }
                 let initial = match mode {
@@ -372,7 +381,6 @@ impl App {
                         .map(|t| t.text.clone())
                         .unwrap_or_default(),
                 };
-                self.last_message = None;
                 return Action::OpenEditor { initial };
             }
             KeyCode::Enter => {
@@ -442,8 +450,7 @@ impl App {
         match result {
             Ok(Some(text)) => self.submit_input(text),
             Ok(None) => {
-                self.last_message =
-                    Some("the editor returned empty text; nothing changed".to_string());
+                self.mode = Mode::Normal;
                 Action::None
             }
             Err(e) => {
@@ -1081,7 +1088,7 @@ mod tests {
         let mut app = App::new();
         app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
-        assert!(app.last_message.as_deref().unwrap().contains("Enter again"));
+        assert!(app.editor_armed());
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Action::OpenEditor {
@@ -1144,12 +1151,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_editor_result_stays_in_input_mode() {
+    fn empty_editor_result_cancels_input() {
         let mut app = App::new();
         app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.finish_editor(Ok(None)), Action::None);
-        assert!(matches!(app.mode, Mode::Input { .. }));
-        assert!(app.last_message.is_some());
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.last_message.is_none());
     }
 
     #[test]

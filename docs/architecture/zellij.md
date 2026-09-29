@@ -11,7 +11,7 @@
 | `zellij --session <name> action new-tab --name <name> --cwd <path> --no-focus -- <argv...>` | workspace 用タブを作り、その中で `loom runner ...` を起動する。標準出力に出る新しいタブの ID を返す | `Zellij::new_tab` |
 | `zellij --session <name> action move-tab --tab-id <id> left` | 作ったタブを管理タブの隣へ寄せる（1 回で 1 つ左へ） | `Zellij::move_tab_left` |
 | `zellij --session <name> action close-pane --pane-id terminal_<id>` | runner が正常終了するとき自分のペインを閉じる | `Zellij::close_pane`（`runner::close_own_pane`） |
-| `zellij --session <name> action go-to-tab-name <name>` | 名前でタブへフォーカス移動 | TUI の `Enter`（`src/tui/mod.rs` が直接実行） |
+| `zellij --session <name> action go-to-tab-name <name>` | 名前でタブへフォーカス移動 | TUI の `Enter`（`Zellij::go_to_tab_name`） |
 | `zellij --session <name> action close-tab-by-id <id>` | 終了済み runner のタブを閉じる（その後に新しいタブを作る） | `ZellijLauncher::launch` |
 
 すべて同期の `std::process::Command` 呼び出しで、`ZELLOOM_ZELLIJ` で `zellij` バイナリのパスを上書きできる（`Zellij` のメソッドは `zellij_bin()`、TUI は同じ環境変数を自分で読む）。`Zellij` のメソッドは `<name>` に core 起動時の `ZELLIJ_SESSION_NAME` を、TUI は TUI 自身の `ZELLIJ_SESSION_NAME` を使う。

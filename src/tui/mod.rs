@@ -181,7 +181,7 @@ fn execute_action(socket_path: &Path, app: &mut App, action: Action) {
         Action::Reject(task_id) => Request::Reject { task_id },
         Action::FocusWorkspaceTab(workspace) => {
             match focus_zellij_tab(&workspace) {
-                Ok(()) => app.last_message = Some(format!("focused workspace '{workspace}'")),
+                Ok(()) => app.last_message = None,
                 Err(e) => app.last_message = Some(e),
             }
             return;
@@ -203,16 +203,7 @@ fn focus_zellij_tab(workspace: &str) -> Result<(), String> {
     let session = std::env::var("ZELLIJ_SESSION_NAME").map_err(|_| {
         "not running inside a Zellij session (ZELLIJ_SESSION_NAME not set)".to_string()
     })?;
-    let bin = std::env::var("ZELLOOM_ZELLIJ").unwrap_or_else(|_| "zellij".to_string());
-    let status = std::process::Command::new(&bin)
-        .args(["--session", &session, "action", "go-to-tab-name", workspace])
-        .status()
-        .map_err(|e| format!("failed to run '{bin}': {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "'{bin} action go-to-tab-name {workspace}' exited with {status}"
-        ))
-    }
+    crate::zellij::Zellij::new(session)
+        .go_to_tab_name(workspace)
+        .map_err(|e| format!("cannot focus workspace '{workspace}': {e}").replace('\n', "  "))
 }

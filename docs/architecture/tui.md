@@ -44,7 +44,7 @@
 | 入力 | 文字入力 / `Backspace` / `Delete` / `←` / `→` / `Home` / `End` | 文字単位（マルチバイト対応）でバッファを編集。`Ctrl` か `Alt` を伴う文字キー（`Ctrl+C`・`Ctrl+U` 以外）は無視し、入力しない。`Shift` はそのまま入力する |
 | 入力 | `Ctrl+U` | カーソルより前を消す |
 | 入力 | 貼り付け（bracketed paste） | 貼り付けたテキストを改行ごとカーソル位置に挿入する（`\r\n` と `\r` は `\n` にそろえる） |
-| 入力 | `Enter`（バッファが空白だけ） | 1 回目は `last_message` に `press Enter again to write the task in <editor>` を出して「エディタ待ち」にする。エディタ待ちでもう一度押すとエディタを開く（下記） |
+| 入力 | `Enter`（バッファが空白だけ） | 1 回目は「エディタ待ち」にし、その間はステータス行に `press Enter again to write the task in <editor>` を出す。エディタ待ちでもう一度押すとエディタを開く（下記） |
 | 入力 | `Enter`（それ以外） | 確定（下記のパースへ）。不正な入力なら入力モードのまま `last_message` にエラーを出す |
 | 入力 | `Esc` | 入力を破棄して通常モードへ戻る |
 | 終了確認 | `y` | core を止めてから終了 |
@@ -52,7 +52,7 @@
 | 終了確認 | `Esc` | 通常モードへ戻る |
 | 終了確認 | その他 | 無視 |
 
-エディタ待ち（`Mode::Input` の `editor_armed`）は、入力モードで `Enter` 以外のキーを押すか貼り付けると解除される。通常モードでの貼り付けは無視し、`last_message` に `press n to add a task before pasting` を出す（貼り付けた文字をショートカットキーとして解釈しないため、端末の bracketed paste を有効にしている）。
+エディタ待ち（`Mode::Input` の `editor_armed`）は、入力モードで `Enter` 以外のキー（`Esc` を含む）を押すか貼り付けると解除され、ステータス行も元の表示に戻る。通常モードでの貼り付けは無視し、`last_message` に `press n to add a task before pasting` を出す（貼り付けた文字をショートカットキーとして解釈しないため、端末の bracketed paste を有効にしている）。
 
 条件を満たさないキー（例: 選択中タスクの状態がその操作に合わない）は何もせず、`last_message` に理由を表示するだけで終わる（`Enter` だけは何も表示しない）。各キーが受け付ける状態は、core がその操作を許す状態（[protocol.md](protocol.md#リクエスト一覧)）の部分集合にしている。
 
@@ -79,9 +79,9 @@ core に到達できない（`core_reachable == false`）ときは確認を出�
 結果は `App::finish_editor` に渡す。
 
 - 空でない本文: 入力行で `Enter` を押したときと同じパース・確定をする（追加なら先頭の `ws:` も解釈する）。
-- 空: 入力モードのまま `the editor returned empty text; nothing changed` を出す。
+- 空: キャンセル扱い。何も出さずに入力モードを抜ける（`Esc` と同じ）。
 - エディタが起動できない・非 0 で終了した: 入力モードのまま `error: ...` を出す。
 
 ## Zellij へのフォーカス移動
 
-`Enter` で `running` タスクを選ぶと `zellij --session $ZELLIJ_SESSION_NAME action go-to-tab-name <workspace>` を直接実行する（`ZELLOOM_ZELLIJ` でバイナリを上書き可能）。`ZELLIJ_SESSION_NAME` が設定されていなければエラーメッセージを `last_message` に出すだけで、TUI 自体は終了しない。
+`Enter` で `running` タスクを選ぶと `Zellij::go_to_tab_name` で `zellij --session $ZELLIJ_SESSION_NAME action go-to-tab-name <workspace>` を実行する（zellij の出力は捕捉し、TUI の画面には流さない）。成功したら `last_message` を消す。`ZELLIJ_SESSION_NAME` が設定されていないときや zellij が失敗したときはエラーメッセージを `last_message` に出すだけで、TUI 自体は終了しない。
