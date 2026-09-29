@@ -38,6 +38,9 @@ pub enum Command {
         workspace: String,
     },
     /// Add a task to the queue
+    #[command(
+        after_help = "Each task runs in a fresh agent session that knows nothing of the conversation it was queued from, so write the text so that it stands on its own: goal, relevant files, constraints, and how to tell it is finished."
+    )]
     Add {
         /// Workspace id (auto-detected from the current directory if omitted)
         #[arg(short = 'w', long = "workspace")]
