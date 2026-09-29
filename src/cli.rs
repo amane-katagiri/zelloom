@@ -416,22 +416,7 @@ fn cmd_config_edit() -> anyhow::Result<()> {
             config_path.display()
         );
     }
-    let editor = ["VISUAL", "EDITOR"]
-        .iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "vi".to_string());
-    // Run through sh so that editors with arguments such as "code --wait" work, as git does.
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(&editor)
-        .arg(&config_path)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run editor {editor:?}: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("editor {editor:?} exited with {status}");
-    }
+    crate::editor::edit(&config_path, |mut command| command.status())?;
     crate::config::load(&config_path)?;
     println!("{} is valid", config_path.display());
     Ok(())

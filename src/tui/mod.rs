@@ -5,7 +5,7 @@ use std::io::Stdout;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -33,7 +33,7 @@ pub fn run() -> anyhow::Result<()> {
 fn setup_terminal() -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -41,7 +41,11 @@ fn setup_terminal() -> anyhow::Result<Term> {
 
 fn restore_terminal(terminal: &mut Term) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -50,7 +54,11 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         original(info);
     }));
 }
@@ -66,27 +74,52 @@ fn run_app(terminal: &mut Term, app: &mut App, socket_path: &Path) -> anyhow::Re
         terminal.draw(|f| ui::render(f, app))?;
 
         let timeout = POLL_INTERVAL.saturating_sub(last_poll.elapsed());
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            let action = app.handle_key(key);
-            match action {
-                Action::Quit => return Ok(()),
-                Action::StopCoreAndQuit { force } => {
-                    app.last_message = Some("stopping core...".to_string());
-                    terminal.draw(|f| ui::render(f, app))?;
-                    match crate::cli::stop_core(socket_path, force, STOP_TIMEOUT) {
-                        Ok(_) => return Ok(()),
-                        Err(e) => {
-                            app.last_message = Some(format!("error: {e}").replace('\n', "  "));
-                        }
+        if !event::poll(timeout)? {
+            continue;
+        }
+        let action = match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Event::Paste(text) => {
+                app.handle_paste(&text);
+                Action::None
+            }
+            _ => Action::None,
+        };
+        let action = match action {
+            Action::OpenEditor { initial } => {
+                let result = edit_in_terminal(terminal, &initial);
+                app.finish_editor(result)
+            }
+            action => action,
+        };
+        match action {
+            Action::Quit => return Ok(()),
+            Action::StopCoreAndQuit { force } => {
+                app.last_message = Some("stopping core...".to_string());
+                terminal.draw(|f| ui::render(f, app))?;
+                match crate::cli::stop_core(socket_path, force, STOP_TIMEOUT) {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        app.last_message = Some(format!("error: {e}").replace('\n', "  "));
                     }
                 }
-                action => execute_action(socket_path, app, action),
             }
+            action => execute_action(socket_path, app, action),
         }
     }
+}
+
+fn edit_in_terminal(terminal: &mut Term, initial: &str) -> anyhow::Result<Option<String>> {
+    restore_terminal(terminal)?;
+    let result = crate::editor::compose(initial, |mut command| command.status());
+    enable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
+    terminal.clear()?;
+    result
 }
 
 fn refresh(socket_path: &Path, app: &mut App) {
@@ -126,7 +159,10 @@ fn fetch_status(socket_path: &Path) -> Option<StatusView> {
 
 fn execute_action(socket_path: &Path, app: &mut App, action: Action) {
     let request = match action {
-        Action::None | Action::Quit | Action::StopCoreAndQuit { .. } => return,
+        Action::None
+        | Action::Quit
+        | Action::StopCoreAndQuit { .. }
+        | Action::OpenEditor { .. } => return,
         Action::Enqueue { workspace, text } => Request::Enqueue {
             text,
             workspace,

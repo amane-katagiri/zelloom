@@ -15,6 +15,7 @@ pub enum Mode {
         mode: InputMode,
         buffer: Vec<char>,
         cursor: usize,
+        editor_armed: bool,
     },
     ConfirmQuit {
         running: usize,
@@ -47,6 +48,9 @@ pub enum Action {
     Accept(String),
     Reject(String),
     FocusWorkspaceTab(String),
+    OpenEditor {
+        initial: String,
+    },
 }
 
 pub struct App {
@@ -267,6 +271,7 @@ impl App {
                     mode: InputMode::Add,
                     buffer: Vec::new(),
                     cursor: 0,
+                    editor_armed: false,
                 };
                 Action::None
             }
@@ -286,6 +291,7 @@ impl App {
                             mode: InputMode::Edit { task_id: id },
                             buffer: chars,
                             cursor,
+                            editor_armed: false,
                         };
                     } else {
                         self.last_message = Some("cannot edit a running task".to_string());
@@ -336,79 +342,143 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::Input {
+            mode,
+            buffer,
+            cursor,
+            editor_armed,
+        } = &mut self.mode
+        else {
+            unreachable!("handle_input_key called outside input mode");
+        };
+        let armed = std::mem::take(editor_armed);
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 return Action::None;
             }
+            KeyCode::Enter if buffer.iter().all(|c| c.is_whitespace()) => {
+                if !armed {
+                    *editor_armed = true;
+                    self.last_message = Some(crate::editor::open_hint());
+                    return Action::None;
+                }
+                let initial = match mode {
+                    InputMode::Add => String::new(),
+                    InputMode::Edit { task_id } => self
+                        .tasks
+                        .iter()
+                        .find(|t| &t.id == task_id)
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default(),
+                };
+                self.last_message = None;
+                return Action::OpenEditor { initial };
+            }
             KeyCode::Enter => {
-                let (input_mode, text) = match &self.mode {
-                    Mode::Input { mode, buffer, .. } => {
-                        (mode.clone(), buffer.iter().collect::<String>())
-                    }
-                    _ => unreachable!("handle_input_key called outside input mode"),
-                };
-                return match input_mode {
-                    InputMode::Add => match self.parse_add_input(&text) {
-                        Ok((workspace, text)) => {
-                            self.mode = Mode::Normal;
-                            Action::Enqueue { workspace, text }
-                        }
-                        Err(e) => {
-                            self.last_message = Some(e);
-                            Action::None
-                        }
-                    },
-                    InputMode::Edit { task_id } => {
-                        if text.trim().is_empty() {
-                            self.last_message = Some("task text cannot be empty".to_string());
-                            Action::None
-                        } else {
-                            self.mode = Mode::Normal;
-                            Action::Edit { task_id, text }
-                        }
-                    }
-                };
+                let text = buffer.iter().collect::<String>();
+                return self.submit_input(text);
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                    buffer.remove(*cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if *cursor < buffer.len() {
+                    buffer.remove(*cursor);
+                }
+            }
+            KeyCode::Left => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if *cursor < buffer.len() {
+                    *cursor += 1;
+                }
+            }
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = buffer.len(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buffer.drain(..*cursor);
+                *cursor = 0;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                buffer.insert(*cursor, c);
+                *cursor += 1;
             }
             _ => {}
         }
-        if let Mode::Input { buffer, cursor, .. } = &mut self.mode {
-            match key.code {
-                KeyCode::Backspace => {
-                    if *cursor > 0 {
-                        *cursor -= 1;
-                        buffer.remove(*cursor);
-                    }
-                }
-                KeyCode::Delete => {
-                    if *cursor < buffer.len() {
-                        buffer.remove(*cursor);
-                    }
-                }
-                KeyCode::Left => {
-                    if *cursor > 0 {
-                        *cursor -= 1;
-                    }
-                }
-                KeyCode::Right => {
-                    if *cursor < buffer.len() {
-                        *cursor += 1;
-                    }
-                }
-                KeyCode::Home => *cursor = 0,
-                KeyCode::End => *cursor = buffer.len(),
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    buffer.insert(*cursor, c);
-                    *cursor += 1;
-                }
-                _ => {}
+        Action::None
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        let Mode::Input {
+            buffer,
+            cursor,
+            editor_armed,
+            ..
+        } = &mut self.mode
+        else {
+            self.last_message = Some("press n to add a task before pasting".to_string());
+            return;
+        };
+        *editor_armed = false;
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for c in normalized.chars() {
+            buffer.insert(*cursor, c);
+            *cursor += 1;
+        }
+    }
+
+    pub fn finish_editor(&mut self, result: anyhow::Result<Option<String>>) -> Action {
+        match result {
+            Ok(Some(text)) => self.submit_input(text),
+            Ok(None) => {
+                self.last_message =
+                    Some("the editor returned empty text; nothing changed".to_string());
+                Action::None
+            }
+            Err(e) => {
+                self.last_message = Some(format!("error: {e}"));
+                Action::None
             }
         }
-        Action::None
+    }
+
+    fn submit_input(&mut self, text: String) -> Action {
+        let Mode::Input { mode, .. } = &self.mode else {
+            return Action::None;
+        };
+        let result = match mode.clone() {
+            InputMode::Add => self
+                .parse_add_input(&text)
+                .map(|(workspace, text)| Action::Enqueue { workspace, text }),
+            InputMode::Edit { task_id } => {
+                if text.trim().is_empty() {
+                    Err("task text cannot be empty".to_string())
+                } else {
+                    Ok(Action::Edit { task_id, text })
+                }
+            }
+        };
+        match result {
+            Ok(action) => {
+                self.mode = Mode::Normal;
+                action
+            }
+            Err(e) => {
+                self.last_message = Some(e);
+                Action::None
+            }
+        }
     }
 }
 
@@ -716,6 +786,7 @@ mod tests {
                 mode,
                 buffer,
                 cursor,
+                ..
             } => {
                 assert_eq!(
                     *mode,
@@ -1003,5 +1074,105 @@ mod tests {
                 Action::Cancel("1".to_string())
             );
         }
+    }
+
+    #[test]
+    fn enter_on_empty_input_arms_then_opens_editor() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(app.last_message.as_deref().unwrap().contains("Enter again"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::OpenEditor {
+                initial: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn other_keys_disarm_the_editor() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(matches!(
+            app.mode,
+            Mode::Input {
+                editor_armed: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clearing_edit_buffer_opens_editor_with_original_text() {
+        let mut app = App::new();
+        app.set_tasks(vec![task("1", TaskStatus::Queued, "a", "old\ntext", 1)]);
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(ctrl(KeyCode::Char('u')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::OpenEditor {
+                initial: "old\ntext".to_string()
+            }
+        );
+        assert_eq!(
+            app.finish_editor(Ok(Some("new\ntext".to_string()))),
+            Action::Edit {
+                task_id: "1".to_string(),
+                text: "new\ntext".to_string(),
+            }
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn editor_text_goes_through_workspace_prefix_parsing() {
+        let mut app = App::new();
+        app.workspace_ids = vec!["ws".to_string()];
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            app.finish_editor(Ok(Some("ws: first\nsecond".to_string()))),
+            Action::Enqueue {
+                workspace: "ws".to_string(),
+                text: "first\nsecond".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn empty_editor_result_stays_in_input_mode() {
+        let mut app = App::new();
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.finish_editor(Ok(None)), Action::None);
+        assert!(matches!(app.mode, Mode::Input { .. }));
+        assert!(app.last_message.is_some());
+    }
+
+    #[test]
+    fn paste_inserts_newlines_into_the_buffer() {
+        let mut app = App::new();
+        app.default_workspace = Some("a".to_string());
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_paste("one\r\ntwo\rthree");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::Enqueue {
+                workspace: "a".to_string(),
+                text: "one\ntwo\nthree".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn paste_in_normal_mode_is_ignored() {
+        let mut app = App::new();
+        app.set_tasks(vec![task("1", TaskStatus::Queued, "a", "keep", 1)]);
+        app.handle_paste("dd\nq");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.tasks.len(), 1);
     }
 }

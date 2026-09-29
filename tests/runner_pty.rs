@@ -66,6 +66,18 @@ impl Harness {
         )
         .unwrap();
 
+        let editor_path = rcbin.join("fake-editor");
+        std::fs::write(
+            &editor_path,
+            "#!/bin/sh\n[ -s \"$1\" ] && exit 1\nprintf '  first line\\nsecond line\\n\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &editor_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
         let posix_rc = "export LOOM_RC_MARKER=rc-loaded\nexport PATH=\"$HOME/rcbin:$PATH\"\nexport RC_OVERRIDE=rc\n";
         std::fs::write(home.join(".bashrc"), posix_rc).unwrap();
         std::fs::write(home.join(".zshrc"), posix_rc).unwrap();
@@ -162,6 +174,7 @@ env = {{ BOTH = "workspace" }}
             .env("SHELL", shell)
             .env("TERM", "xterm")
             .env("ZELLOOM_ZELLIJ", "/nonexistent")
+            .env("EDITOR", self.home.join("rcbin/fake-editor"))
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -556,5 +569,31 @@ fn idle_runner_queues_typed_lines_for_its_workspace() {
     let agent = harness.wait_agent(&second.id);
     harness.loom_done(&agent.env);
     harness.wait_status(&second.id, TaskStatus::Done);
+    harness.finish();
+}
+
+#[test]
+fn idle_runner_queues_a_task_written_in_the_editor_after_two_empty_lines() {
+    let mut harness = Harness::new(false);
+    harness.start_runner(&find_program("bash").unwrap());
+
+    harness.type_line("");
+    wait_until("editor hint", Duration::from_secs(10), || {
+        harness.pty_text().contains("press Enter again")
+    });
+    assert!(harness.list().is_empty());
+
+    harness.type_line("");
+    wait_until("edited task to be queued", Duration::from_secs(10), || {
+        !harness.list().is_empty()
+    });
+    let task = harness.list().remove(0);
+    assert_eq!(task.text, "first line\nsecond line");
+    assert_eq!(task.source.kind, "runner");
+
+    let agent = harness.wait_agent(&task.id);
+    assert_eq!(agent.args[3], "first line\nsecond line");
+    harness.loom_done(&agent.env);
+    harness.wait_status(&task.id, TaskStatus::Done);
     harness.finish();
 }

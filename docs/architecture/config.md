@@ -175,7 +175,7 @@ instruction_args = ["-c", "developer_instructions={instruction}"]
 
 ## `loom config edit`
 
-`paths::config_path()` のファイルをエディタで開く。ファイルが無ければエディタを起動せず、`loom init` を促すエラーにする。
+`paths::config_path()` のファイルをエディタで開く（`editor::edit`。エディタの解決と起動は TUI・runner の複数行入力と共通）。ファイルが無ければエディタを起動せず、`loom init` を促すエラーにする。
 
 - エディタは `VISUAL`、`EDITOR` の順で空でない最初のものを使い、どちらも無ければ `vi`。
 - 値に引数を含められるよう（`code --wait` など）、`sh -c '<editor> "$@"' <editor> <path>` で起動する。

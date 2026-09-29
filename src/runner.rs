@@ -118,14 +118,16 @@ pub fn run(workspace: String) -> anyhow::Result<()> {
     }
 
     let mut input = open_tty().ok();
+    let mut editor_armed = false;
     print_idle_banner(&workspace, input.is_some());
 
     loop {
-        match wait_idle(&mut input, &mut rx, &workspace) {
+        match wait_idle(&mut input, &mut editor_armed, &mut rx, &workspace) {
             Ok(RunnerMsg::Server(ServerMessage::Event(RunnerEvent::Start { task, agent }))) => {
                 if let Some(tty) = &input {
                     let _ = termios::tcflush(tty, termios::FlushArg::TCIFLUSH);
                 }
+                editor_armed = false;
                 if run_task(task, agent, &mut writer, &mut rx, &tx) {
                     print_idle_banner(&workspace, input.is_some());
                 } else {
@@ -243,6 +245,7 @@ fn print_idle_banner(workspace: &str, accepts_input: bool) {
     println!("\nzelloom runner: {workspace} — waiting for tasks\n");
     if accepts_input {
         println!("type a task and press Enter to queue it for {workspace}");
+        println!("press Enter on an empty line twice to write a multi-line task in an editor");
         print_input_prompt();
     }
 }
@@ -255,6 +258,7 @@ fn print_input_prompt() {
 // Polls instead of reading the tty on a separate thread, because such a thread would keep reading from the background and steal input once the agent owns the terminal.
 fn wait_idle(
     input: &mut Option<File>,
+    editor_armed: &mut bool,
     rx: &mut EventStream,
     workspace: &str,
 ) -> Result<RunnerMsg, mpsc::RecvError> {
@@ -270,8 +274,18 @@ fn wait_idle(
         match read_input_line(tty) {
             Ok(Some(line)) => {
                 let text = line.trim();
+                let armed = std::mem::take(editor_armed);
                 if !text.is_empty() {
                     enqueue_from_runner(workspace, text);
+                } else if !armed {
+                    *editor_armed = true;
+                    println!("{}", crate::editor::open_hint());
+                } else {
+                    match edit_in_foreground(tty) {
+                        Ok(Some(text)) => enqueue_from_runner(workspace, &text),
+                        Ok(None) => println!("the editor returned empty text; nothing queued"),
+                        Err(e) => eprintln!("[zelloom-runner] {e:#}"),
+                    }
                 }
                 print_input_prompt();
             }
@@ -373,6 +387,11 @@ fn build_command(agent: &ResolvedAgent, argv: &[OsString], tty: &File) -> Comman
     for (key, value) in &agent.env {
         command.env(key, value);
     }
+    take_foreground_on_exec(&mut command, tty);
+    command
+}
+
+fn take_foreground_on_exec(command: &mut Command, tty: &File) {
     let tty_fd = tty.as_raw_fd();
     unsafe {
         command.pre_exec(move || {
@@ -396,7 +415,21 @@ fn build_command(agent: &ResolvedAgent, argv: &[OsString], tty: &File) -> Comman
             Ok(())
         });
     }
-    command
+}
+
+fn edit_in_foreground(tty: &File) -> anyhow::Result<Option<String>> {
+    let runner_pgid = unistd::getpgid(None).unwrap_or_else(|_| Pid::this());
+    let saved_termios = termios::tcgetattr(tty).ok();
+    crate::editor::compose("", |mut command| {
+        take_foreground_on_exec(&mut command, tty);
+        let mut child = command.spawn()?;
+        let pid = Pid::from_raw(child.id() as i32);
+        let _ = unistd::setpgid(pid, pid);
+        let _ = unistd::tcsetpgrp(tty, pid);
+        let status = child.wait();
+        restore_terminal(tty, saved_termios.as_ref(), runner_pgid);
+        status
+    })
 }
 
 fn write_escape(tty: &File, seq: &str) {

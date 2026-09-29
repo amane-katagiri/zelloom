@@ -2,6 +2,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod core;
+pub mod editor;
 pub mod http;
 pub mod launcher;
 pub mod paths;

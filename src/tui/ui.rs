@@ -79,7 +79,7 @@ fn render_section(
     let items: Vec<ListItem> = tasks
         .iter()
         .map(|t| {
-            let line = fmt(t);
+            let line = single_line(&fmt(t));
             let style = if selected_id.as_deref() == Some(t.id.as_str()) {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -96,6 +96,10 @@ fn render_section(
     frame.render_widget(list, area);
 }
 
+fn single_line(text: &str) -> String {
+    text.replace('\n', "\u{23ce}")
+}
+
 fn render_input_line(frame: &mut Frame, area: Rect, app: &App) {
     if let Mode::ConfirmQuit { running } = app.mode {
         let prompt = App::confirm_quit_prompt(running);
@@ -108,9 +112,11 @@ fn render_input_line(frame: &mut Frame, area: Rect, app: &App) {
     let prefix = "> ";
     let (text, cursor, placeholder) = match &app.mode {
         Mode::Normal => ("add task...".to_string(), None, true),
-        Mode::Input { buffer, cursor, .. } => {
-            (buffer.iter().collect::<String>(), Some(*cursor), false)
-        }
+        Mode::Input { buffer, cursor, .. } => (
+            single_line(&buffer.iter().collect::<String>()),
+            Some(*cursor),
+            false,
+        ),
         Mode::ConfirmQuit { .. } => unreachable!("confirm prompt rendered above"),
     };
     let style = if placeholder {
@@ -227,6 +233,20 @@ mod tests {
         }
         let text = rendered_text(&app);
         assert!(text.contains("amanejp: 新しいタスク"));
+    }
+
+    #[test]
+    fn renders_multi_line_text_on_one_line() {
+        let mut app = App::new();
+        app.set_tasks(vec![task("1", TaskStatus::Queued, "a", "first\nsecond", 1)]);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.handle_paste("x\ny");
+        let text = rendered_text(&app);
+        assert!(text.contains("first\u{23ce}second"));
+        assert!(text.contains("> x\u{23ce}y"));
     }
 
     #[test]
