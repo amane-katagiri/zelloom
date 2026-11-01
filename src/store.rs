@@ -1,10 +1,15 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::protocol::{MoveDirection, Source, Task, TaskStatus};
+use tokio::sync::broadcast;
+
+use crate::protocol::{
+    Attention, AttentionKind, MoveDirection, Source, Task, TaskStatus, TurnState, WatchEvent,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -51,8 +56,100 @@ pub struct NewTask {
     pub status: TaskStatus,
 }
 
+const WATCH_CHANNEL_CAPACITY: usize = 1024;
+
+const WATCHED_STATUSES: [TaskStatus; 4] = [
+    TaskStatus::Received,
+    TaskStatus::Queued,
+    TaskStatus::Running,
+    TaskStatus::Interrupted,
+];
+
+struct TurnRecord {
+    state: TurnState,
+    idle_mark: u64,
+    sending: Option<u64>,
+}
+
+impl TurnRecord {
+    fn busy() -> TurnRecord {
+        TurnRecord {
+            state: TurnState::Busy,
+            idle_mark: 0,
+            sending: None,
+        }
+    }
+}
+
+struct Inner {
+    conn: Connection,
+    attention: HashMap<String, Attention>,
+    turns: HashMap<String, TurnRecord>,
+    seq: u64,
+}
+
+impl Inner {
+    fn with_attention(&self, mut task: Task) -> Task {
+        task.attention = self.attention.get(&task.id).cloned();
+        task.turn = self.turns.get(&task.id).map(|t| t.state);
+        task
+    }
+
+    fn get(&self, id: &str) -> Result<Option<Task>, StoreError> {
+        Ok(get_locked(&self.conn, id)?.map(|t| self.with_attention(t)))
+    }
+
+    fn get_existing(&self, id: &str) -> Result<Task, StoreError> {
+        self.get(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    fn query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Task>, StoreError> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params, map_row)?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(self.with_attention(to_task(row?)?));
+        }
+        Ok(tasks)
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    fn is_running(&self, id: &str) -> Result<Option<Task>, StoreError> {
+        Ok(get_locked(&self.conn, id)?.filter(|t| t.status == TaskStatus::Running))
+    }
+
+    fn forget(&mut self, id: &str) {
+        self.attention.remove(id);
+        self.turns.remove(id);
+    }
+}
+
+pub enum SendRejection {
+    NotFound,
+    NotRunning(TaskStatus),
+    InFlight,
+    NoAttention,
+    NotAwaitingReply(AttentionKind),
+    ExpectMismatch { current: u64 },
+    TurnBusy,
+    TurnNotEndedSinceReport,
+}
+
+pub struct AcceptedSend {
+    pub task: Task,
+    pub input_id: u64,
+    pub previous: Attention,
+}
+
+// Every mutation publishes its watch event while still holding `inner`, so subscribers see changes in commit order and a snapshot taken under the same lock cannot miss or repeat one.
 pub struct Store {
-    conn: Mutex<Connection>,
+    inner: Mutex<Inner>,
+    events: broadcast::Sender<WatchEvent>,
 }
 
 struct RawRow {
@@ -100,6 +197,8 @@ fn to_task(raw: RawRow) -> Result<Task, StoreError> {
         position: raw.position,
         created_at: raw.created_at,
         updated_at: raw.updated_at,
+        attention: None,
+        turn: None,
     })
 }
 
@@ -114,7 +213,7 @@ fn get_locked(conn: &Connection, id: &str) -> Result<Option<Task>, StoreError> {
     raw.map(to_task).transpose()
 }
 
-fn now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     jiff::Zoned::now()
         .strftime("%Y-%m-%dT%H:%M:%S%:z")
         .to_string()
@@ -125,23 +224,202 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Store {
-            conn: Mutex::new(conn),
-        })
+        Store::with_connection(Connection::open(path)?)
     }
 
     pub fn open_in_memory() -> Result<Store, StoreError> {
-        let conn = Connection::open_in_memory()?;
+        Store::with_connection(Connection::open_in_memory()?)
+    }
+
+    fn with_connection(conn: Connection) -> Result<Store, StoreError> {
         conn.execute_batch(SCHEMA)?;
         Ok(Store {
-            conn: Mutex::new(conn),
+            inner: Mutex::new(Inner {
+                conn,
+                attention: HashMap::new(),
+                turns: HashMap::new(),
+                seq: 0,
+            }),
+            events: broadcast::Sender::new(WATCH_CHANNEL_CAPACITY),
         })
     }
 
+    fn publish(&self, task: &Task) {
+        let _ = self.events.send(WatchEvent::Task { task: task.clone() });
+    }
+
+    pub fn watch(&self) -> Result<(Vec<Task>, broadcast::Receiver<WatchEvent>), StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let receiver = self.events.subscribe();
+        let watched: Vec<&str> = WATCHED_STATUSES.iter().map(TaskStatus::as_str).collect();
+        let tasks = inner.query(
+            &format!(
+                "SELECT {SELECT_COLUMNS} FROM tasks WHERE status IN (SELECT value FROM json_each(?1)) ORDER BY position ASC"
+            ),
+            params![serde_json::to_string(&watched)?],
+        )?;
+        Ok((tasks, receiver))
+    }
+
+    fn publish_locked(&self, inner: &Inner, id: &str) -> Result<Task, StoreError> {
+        let task = inner.get_existing(id)?;
+        self.publish(&task);
+        Ok(task)
+    }
+
+    pub fn set_attention(
+        &self,
+        id: &str,
+        kind: AttentionKind,
+        message: String,
+    ) -> Result<Option<Task>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.is_running(id)?.is_none() {
+            return Ok(None);
+        }
+        let report_id = inner.next_seq();
+        inner.attention.insert(
+            id.to_string(),
+            Attention {
+                id: report_id,
+                kind,
+                message,
+                at: now_rfc3339(),
+            },
+        );
+        inner
+            .turns
+            .entry(id.to_string())
+            .or_insert_with(TurnRecord::busy)
+            .state = TurnState::Busy;
+        self.publish_locked(&inner, id).map(Some)
+    }
+
+    pub fn set_turn(&self, id: &str, state: TurnState) -> Result<Option<Task>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(task) = inner.is_running(id)? else {
+            return Ok(None);
+        };
+        let mark = match state {
+            TurnState::Idle => Some(inner.next_seq()),
+            TurnState::Busy => None,
+        };
+        let record = inner
+            .turns
+            .entry(id.to_string())
+            .or_insert_with(TurnRecord::busy);
+        let changed = record.state != state;
+        record.state = state;
+        if let Some(mark) = mark {
+            record.idle_mark = mark;
+        }
+        if changed {
+            return self.publish_locked(&inner, id).map(Some);
+        }
+        Ok(Some(inner.with_attention(task)))
+    }
+
+    pub fn reset_turn(&self, id: &str) -> Result<Option<Task>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.is_running(id)?.is_none() {
+            return Ok(None);
+        }
+        inner.attention.remove(id);
+        inner.turns.insert(id.to_string(), TurnRecord::busy());
+        self.publish_locked(&inner, id).map(Some)
+    }
+
+    pub fn begin_send(
+        &self,
+        id: &str,
+        expect: u64,
+    ) -> Result<Result<AcceptedSend, SendRejection>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(task) = get_locked(&inner.conn, id)? else {
+            return Ok(Err(SendRejection::NotFound));
+        };
+        if task.status != TaskStatus::Running {
+            return Ok(Err(SendRejection::NotRunning(task.status)));
+        }
+        let turn = inner.turns.get(id);
+        if turn.is_some_and(|t| t.sending.is_some()) {
+            return Ok(Err(SendRejection::InFlight));
+        }
+        let Some(attention) = inner.attention.get(id) else {
+            return Ok(Err(SendRejection::NoAttention));
+        };
+        if !attention.kind.awaits_reply() {
+            return Ok(Err(SendRejection::NotAwaitingReply(attention.kind)));
+        }
+        if attention.id != expect {
+            return Ok(Err(SendRejection::ExpectMismatch {
+                current: attention.id,
+            }));
+        }
+        match turn {
+            Some(t) if t.state == TurnState::Idle && t.idle_mark > attention.id => {}
+            Some(t) if t.state == TurnState::Idle => {
+                return Ok(Err(SendRejection::TurnNotEndedSinceReport));
+            }
+            _ => return Ok(Err(SendRejection::TurnBusy)),
+        }
+        let previous = attention.clone();
+        let input_id = inner.next_seq();
+        inner.attention.remove(id);
+        let record = inner.turns.get_mut(id).expect("turn checked above");
+        record.state = TurnState::Busy;
+        record.sending = Some(input_id);
+        let task = self.publish_locked(&inner, id)?;
+        Ok(Ok(AcceptedSend {
+            task,
+            input_id,
+            previous,
+        }))
+    }
+
+    pub fn finish_send(&self, id: &str, input_id: u64) -> Result<Option<Task>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(record) = inner.turns.get_mut(id)
+            && record.sending == Some(input_id)
+        {
+            record.sending = None;
+        }
+        inner.get(id)
+    }
+
+    pub fn abort_send(
+        &self,
+        id: &str,
+        input_id: u64,
+        previous: Attention,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let ours = inner
+            .turns
+            .get(id)
+            .is_some_and(|t| t.sending == Some(input_id));
+        if !ours {
+            return Ok(false);
+        }
+        if inner.attention.contains_key(id) {
+            if let Some(record) = inner.turns.get_mut(id) {
+                record.sending = None;
+            }
+            return Ok(false);
+        }
+        let mark = inner.next_seq();
+        let record = inner.turns.get_mut(id).expect("checked above");
+        record.sending = None;
+        record.state = TurnState::Idle;
+        record.idle_mark = mark;
+        inner.attention.insert(id.to_string(), previous);
+        self.publish_locked(&inner, id)?;
+        Ok(true)
+    }
+
     pub fn insert(&self, new_task: NewTask) -> Result<Task, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        let conn = &inner.conn;
         let id = ulid::Ulid::generate().to_string();
         let now = now_rfc3339();
         let position: i64 = conn.query_row(
@@ -170,38 +448,27 @@ impl Store {
                 now,
             ],
         )?;
-        get_locked(&conn, &id)?.ok_or(StoreError::NotFound(id))
+        let task = inner.get_existing(&id)?;
+        self.publish(&task);
+        Ok(task)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Task>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        get_locked(&conn, id)
+        self.inner.lock().unwrap().get(id)
     }
 
     pub fn list_all(&self) -> Result<Vec<Task>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {SELECT_COLUMNS} FROM tasks ORDER BY position ASC"
-        ))?;
-        let rows = stmt.query_map([], map_row)?;
-        let mut tasks = Vec::new();
-        for row in rows {
-            tasks.push(to_task(row?)?);
-        }
-        Ok(tasks)
+        self.inner.lock().unwrap().query(
+            &format!("SELECT {SELECT_COLUMNS} FROM tasks ORDER BY position ASC"),
+            [],
+        )
     }
 
     pub fn list_by_status(&self, status: TaskStatus) -> Result<Vec<Task>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {SELECT_COLUMNS} FROM tasks WHERE status = ?1 ORDER BY position ASC"
-        ))?;
-        let rows = stmt.query_map(params![status.as_str()], map_row)?;
-        let mut tasks = Vec::new();
-        for row in rows {
-            tasks.push(to_task(row?)?);
-        }
-        Ok(tasks)
+        self.inner.lock().unwrap().query(
+            &format!("SELECT {SELECT_COLUMNS} FROM tasks WHERE status = ?1 ORDER BY position ASC"),
+            params![status.as_str()],
+        )
     }
 
     pub fn update_status_if(
@@ -210,18 +477,24 @@ impl Store {
         expected: TaskStatus,
         status: TaskStatus,
     ) -> Result<Option<Task>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let now = now_rfc3339();
-        let changed = conn.execute(
+        let changed = inner.conn.execute(
             "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
             params![status.as_str(), now, id, expected.as_str()],
         )?;
         if changed == 0 {
             return Ok(None);
         }
-        get_locked(&conn, id)?
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))
-            .map(Some)
+        if status == TaskStatus::Running {
+            inner.attention.remove(id);
+            inner.turns.insert(id.to_string(), TurnRecord::busy());
+        } else {
+            inner.forget(id);
+        }
+        let task = inner.get_existing(id)?;
+        self.publish(&task);
+        Ok(Some(task))
     }
 
     pub fn update_text_unless(
@@ -230,33 +503,42 @@ impl Store {
         text: &str,
         excluded: TaskStatus,
     ) -> Result<Option<Task>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         let now = now_rfc3339();
-        let changed = conn.execute(
+        let changed = inner.conn.execute(
             "UPDATE tasks SET text = ?1, updated_at = ?2 WHERE id = ?3 AND status != ?4",
             params![text, now, id, excluded.as_str()],
         )?;
         if changed == 0 {
             return Ok(None);
         }
-        get_locked(&conn, id)
+        let task = inner.get_existing(id)?;
+        self.publish(&task);
+        Ok(Some(task))
     }
 
     pub fn delete_unless(&self, id: &str, excluded: TaskStatus) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
+        let mut inner = self.inner.lock().unwrap();
+        let changed = inner.conn.execute(
             "DELETE FROM tasks WHERE id = ?1 AND status != ?2",
             params![id, excluded.as_str()],
         )?;
-        Ok(changed > 0)
+        if changed == 0 {
+            return Ok(false);
+        }
+        inner.forget(id);
+        let _ = self.events.send(WatchEvent::TaskDeleted {
+            task_id: id.to_string(),
+        });
+        Ok(true)
     }
 
     pub fn retry_if(&self, id: &str, allowed: &[TaskStatus]) -> Result<Option<Task>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let now = now_rfc3339();
         let allowed: Vec<&str> = allowed.iter().map(TaskStatus::as_str).collect();
         let allowed = serde_json::to_string(&allowed)?;
-        let changed = conn.execute(
+        let changed = inner.conn.execute(
             "UPDATE tasks
              SET status = 'queued',
                  position = (SELECT COALESCE(MAX(position), 0) + 1 FROM tasks),
@@ -267,11 +549,15 @@ impl Store {
         if changed == 0 {
             return Ok(None);
         }
-        get_locked(&conn, id)
+        inner.forget(id);
+        let task = inner.get_existing(id)?;
+        self.publish(&task);
+        Ok(Some(task))
     }
 
     pub fn move_task(&self, id: &str, direction: MoveDirection) -> Result<Task, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        let conn = &inner.conn;
         let mut stmt = conn.prepare(
             "SELECT id, position FROM tasks WHERE status IN ('queued', 'received') ORDER BY position ASC",
         )?;
@@ -302,15 +588,21 @@ impl Store {
                 "UPDATE tasks SET position = ?1, updated_at = ?2 WHERE id = ?3",
                 params![this_pos, now, neighbor_id],
             )?;
+            self.publish(&inner.get_existing(&neighbor_id)?);
+            let task = inner.get_existing(&this_id)?;
+            self.publish(&task);
+            return Ok(task);
         }
 
-        get_locked(&conn, id)?.ok_or_else(|| StoreError::NotFound(id.to_string()))
+        inner.get_existing(id)
     }
 
     pub fn mark_all_running_interrupted(&self) -> Result<usize, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.attention.clear();
+        inner.turns.clear();
         let now = now_rfc3339();
-        let changed = conn.execute(
+        let changed = inner.conn.execute(
             "UPDATE tasks SET status = 'interrupted', updated_at = ?1 WHERE status = 'running'",
             params![now],
         )?;

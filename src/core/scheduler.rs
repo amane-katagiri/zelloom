@@ -8,9 +8,16 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
-use crate::config::{self, AgentConfig, Config, INSTRUCTION_PLACEHOLDER, WorkspaceConfig};
-use crate::protocol::{Outcome, ResolvedAgent, Response, RunnerEvent, Source, Task, TaskStatus};
-use crate::store::{NewTask, Store, StoreError};
+use super::agent::{
+    build_argv, build_env, build_instruction, loom_exe_path, validate_reply,
+    validate_report_message,
+};
+use crate::config::{self, AgentConfig, Config, WorkspaceConfig};
+use crate::protocol::{
+    AttentionKind, InputOutcome, Outcome, ResolvedAgent, Response, RunnerEvent, Source, Task,
+    TaskStatus, TurnState, WatchEvent,
+};
+use crate::store::{AcceptedSend, NewTask, SendRejection, Store, StoreError};
 
 pub trait TabLauncher: Send + Sync {
     fn launch(&self, workspace_id: &str, workspace_path: &Path) -> anyhow::Result<()>;
@@ -30,13 +37,41 @@ impl TabLauncher for NoopLauncher {
 }
 
 const DEFAULT_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_INPUT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_WATCH_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn attach_timeout_from_env() -> Duration {
-    std::env::var("ZELLOOM_ATTACH_TIMEOUT_MS")
+fn duration_from_env(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_ATTACH_TIMEOUT)
+        .unwrap_or(default)
+}
+
+pub fn attach_timeout_from_env() -> Duration {
+    duration_from_env("ZELLOOM_ATTACH_TIMEOUT_MS", DEFAULT_ATTACH_TIMEOUT)
+}
+
+pub fn input_timeout_from_env() -> Duration {
+    duration_from_env("ZELLOOM_INPUT_TIMEOUT_MS", DEFAULT_INPUT_TIMEOUT)
+}
+
+pub fn watch_write_timeout_from_env() -> Duration {
+    duration_from_env(
+        "ZELLOOM_WATCH_WRITE_TIMEOUT_MS",
+        DEFAULT_WATCH_WRITE_TIMEOUT,
+    )
+}
+
+struct InputReport {
+    outcome: InputOutcome,
+    error: Option<String>,
+}
+
+struct PendingInput {
+    task_id: String,
+    attach_id: u64,
+    reply: tokio::sync::oneshot::Sender<InputReport>,
 }
 
 struct RunnerHandle {
@@ -51,14 +86,27 @@ pub struct Scheduler {
     socket_path: PathBuf,
     launcher: Arc<dyn TabLauncher>,
     attach_timeout: Duration,
+    input_timeout: Duration,
     pub zellij_session_name: Option<String>,
     runners: Mutex<HashMap<String, RunnerHandle>>,
+    pending_inputs: std::sync::Mutex<HashMap<u64, PendingInput>>,
     next_attach_id: AtomicU64,
     // Per-task counter bumped on each launch attempt so a stale attach-timeout captured at an earlier generation becomes a no-op instead of interrupting a newer attempt.
     launch_generation: Mutex<HashMap<String, u64>>,
     // Held for the whole body of `schedule()` so concurrent callers can't dispatch off the same stale "task/workspace free" snapshot.
     scheduling_lock: Mutex<()>,
     shutdown: watch::Sender<bool>,
+}
+
+fn task_not_found(task_id: &str) -> Response {
+    Response::err(format!("task '{task_id}' not found"))
+}
+
+fn task_not_running(task_id: &str, status: TaskStatus) -> Response {
+    Response::err(format!(
+        "task '{task_id}' is '{}', not 'running'",
+        status.as_str()
+    ))
 }
 
 pub(crate) fn send_json<T: serde::Serialize>(
@@ -69,61 +117,6 @@ pub(crate) fn send_json<T: serde::Serialize>(
         line.push('\n');
         let _ = sender.send(line);
     }
-}
-
-fn loom_exe_path() -> String {
-    std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "loom".to_string())
-}
-
-fn build_instruction(loom_exe: &str) -> String {
-    format!(
-        "You are running inside zelloom.\n\
-         \n\
-         Each session corresponds to exactly one task.\n\
-         \n\
-         Do not end the task merely because you believe the work is complete.\n\
-         \n\
-         When the user explicitly confirms that the current task is finished, run:\n\
-         \n\
-         \x20   {loom_exe} done\n"
-    )
-}
-
-fn build_argv(agent_cfg: &AgentConfig, instruction: &str, text: &str) -> Vec<String> {
-    let mut argv = agent_cfg.command.clone();
-    if agent_cfg.oneshot {
-        argv.push(text.to_string());
-        return argv;
-    }
-    match &agent_cfg.instruction_args {
-        Some(args) => {
-            argv.extend(
-                args.iter()
-                    .map(|arg| arg.replace(INSTRUCTION_PLACEHOLDER, instruction)),
-            );
-            argv.push(text.to_string());
-        }
-        None => {
-            argv.push(format!("{instruction}\n{text}"));
-        }
-    }
-    argv
-}
-
-fn build_env(
-    agent_cfg: &AgentConfig,
-    ws: &WorkspaceConfig,
-    task: &Task,
-    socket_path: &str,
-) -> BTreeMap<String, String> {
-    let mut env = agent_cfg.env.clone();
-    env.extend(ws.env.clone());
-    env.insert("ZELLOOM_TASK_ID".to_string(), task.id.clone());
-    env.insert("ZELLOOM_WORKSPACE".to_string(), task.workspace.clone());
-    env.insert("ZELLOOM_SOCKET".to_string(), socket_path.to_string());
-    env
 }
 
 fn finishable_from(target: TaskStatus) -> &'static [TaskStatus] {
@@ -146,6 +139,7 @@ impl Scheduler {
         launcher: Arc<dyn TabLauncher>,
         zellij_session_name: Option<String>,
         attach_timeout: Duration,
+        input_timeout: Duration,
     ) -> Scheduler {
         Scheduler {
             store,
@@ -153,8 +147,10 @@ impl Scheduler {
             socket_path,
             launcher,
             attach_timeout,
+            input_timeout,
             zellij_session_name,
             runners: Mutex::new(HashMap::new()),
+            pending_inputs: std::sync::Mutex::new(HashMap::new()),
             next_attach_id: AtomicU64::new(1),
             launch_generation: Mutex::new(HashMap::new()),
             scheduling_lock: Mutex::new(()),
@@ -173,9 +169,15 @@ impl Scheduler {
         task: &Task,
     ) -> ResolvedAgent {
         let loom_exe = loom_exe_path();
-        let instruction = build_instruction(&loom_exe);
+        let instruction = build_instruction(agent_cfg, &loom_exe);
         let argv = build_argv(agent_cfg, &instruction, &task.text);
-        let env = build_env(agent_cfg, ws, task, &self.socket_path.to_string_lossy());
+        let env = build_env(
+            agent_cfg,
+            ws,
+            task,
+            &self.socket_path.to_string_lossy(),
+            &loom_exe,
+        );
         ResolvedAgent {
             argv,
             cwd: ws.path.to_string_lossy().into_owned(),
@@ -200,6 +202,7 @@ impl Scheduler {
                     .await
             }
             Request::List => self.list().await,
+            Request::Get { task_id } => self.get(&task_id),
             Request::Complete { task_id } => self.finish(&task_id, TaskStatus::Done).await,
             Request::Fail { task_id } => self.finish(&task_id, TaskStatus::Failed).await,
             Request::Cancel { task_id } => self.finish(&task_id, TaskStatus::Cancelled).await,
@@ -217,6 +220,247 @@ impl Scheduler {
             Request::AgentExited { .. } => {
                 Response::err("agent_exited is only accepted on a runner connection")
             }
+            Request::InputResult { .. } => {
+                Response::err("input_result is only accepted on a runner connection")
+            }
+            Request::AgentGone { .. } => {
+                Response::err("agent_gone is only accepted on a runner connection")
+            }
+            Request::Turn { task_id, state } => self.turn(&task_id, state),
+            Request::Report {
+                task_id,
+                kind,
+                message,
+            } => self.report(&task_id, kind, message),
+            Request::Watch => Response::err("watch must be the first message on a connection"),
+            Request::Send {
+                task_id,
+                expect,
+                text,
+            } => self.send_reply(&task_id, expect, &text).await,
+        }
+    }
+
+    pub fn watch(
+        &self,
+    ) -> Result<(Vec<Task>, tokio::sync::broadcast::Receiver<WatchEvent>), StoreError> {
+        self.store.watch()
+    }
+
+    fn not_running_error(&self, task_id: &str) -> Response {
+        match self.current_status(task_id) {
+            Ok(current) => task_not_running(task_id, current),
+            Err(response) => response,
+        }
+    }
+
+    fn report(&self, task_id: &str, kind: AttentionKind, message: String) -> Response {
+        let message = match validate_report_message(&message) {
+            Ok(m) => m,
+            Err(e) => return Response::err(e),
+        };
+        match self.store.set_attention(task_id, kind, message) {
+            Ok(Some(task)) => Response::ok(serde_json::to_value(&task).unwrap()),
+            Ok(None) => self.not_running_error(task_id),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn turn(&self, task_id: &str, state: TurnState) -> Response {
+        match self.store.set_turn(task_id, state) {
+            Ok(Some(task)) => Response::ok(serde_json::to_value(&task).unwrap()),
+            Ok(None) => self.not_running_error(task_id),
+            Err(e) => Response::err(e.to_string()),
+        }
+    }
+
+    fn send_rejection(task_id: &str, expect: u64, rejection: SendRejection) -> Response {
+        let message = match rejection {
+            SendRejection::NotFound => return task_not_found(task_id),
+            SendRejection::NotRunning(status) => return task_not_running(task_id, status),
+            SendRejection::InFlight => {
+                format!("a reply to task '{task_id}' is still being delivered")
+            }
+            SendRejection::NoAttention => {
+                format!("task '{task_id}' is not waiting for a reply (no attention)")
+            }
+            SendRejection::NotAwaitingReply(kind) => format!(
+                "task '{task_id}' is not waiting for a reply (attention: {})",
+                kind.as_str()
+            ),
+            SendRejection::ExpectMismatch { current } => format!(
+                "the reply is for report {expect}, but the current report of task '{task_id}' is {current}; read it before replying"
+            ),
+            SendRejection::TurnBusy => format!(
+                "task '{task_id}' is still in its turn (turn: busy); wait until its agent ends the turn"
+            ),
+            SendRejection::TurnNotEndedSinceReport => format!(
+                "task '{task_id}' has not ended its turn since report {expect}; wait until it does"
+            ),
+        };
+        Response::err(message)
+    }
+
+    async fn send_reply(&self, task_id: &str, expect: u64, text: &str) -> Response {
+        let text = match validate_reply(text) {
+            Ok(t) => t,
+            Err(e) => return Response::err(e),
+        };
+        let task = match self.running_task(task_id) {
+            Ok(task) => task,
+            Err(response) => return response,
+        };
+        let (accepted, report) = {
+            let runners = self.runners.lock().await;
+            let Some(handle) = runners.get(&task.workspace) else {
+                return Response::err(format!(
+                    "no runner is attached for workspace '{}'",
+                    task.workspace
+                ));
+            };
+            if handle.current_task.as_deref() != Some(task_id) {
+                return Response::err(format!(
+                    "task '{task_id}' is not the current task of the runner for workspace '{}'",
+                    task.workspace
+                ));
+            }
+            let accepted = match self.store.begin_send(task_id, expect) {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(rejection)) => return Self::send_rejection(task_id, expect, rejection),
+                Err(e) => return Response::err(e.to_string()),
+            };
+            let (reply, report) = tokio::sync::oneshot::channel();
+            self.pending_inputs.lock().unwrap().insert(
+                accepted.input_id,
+                PendingInput {
+                    task_id: task_id.to_string(),
+                    attach_id: handle.attach_id,
+                    reply,
+                },
+            );
+            send_json(
+                &handle.sender,
+                &RunnerEvent::Input {
+                    task_id: task_id.to_string(),
+                    input_id: accepted.input_id,
+                    text,
+                },
+            );
+            (accepted, report)
+        };
+        let waited = tokio::time::timeout(self.input_timeout, report).await;
+        self.pending_inputs
+            .lock()
+            .unwrap()
+            .remove(&accepted.input_id);
+        self.finish_reply(task_id, accepted, waited)
+    }
+
+    fn finish_reply(
+        &self,
+        task_id: &str,
+        accepted: AcceptedSend,
+        waited: Result<
+            Result<InputReport, tokio::sync::oneshot::error::RecvError>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> Response {
+        let AcceptedSend {
+            task,
+            input_id,
+            previous,
+        } = accepted;
+        let unconfirmed = |why: String| {
+            Response::err(format!(
+                "delivery of the reply to task '{task_id}' is unconfirmed: {why}; check its tab before replying again"
+            ))
+        };
+        let detail = |error: Option<String>| error.map(|e| format!(": {e}")).unwrap_or_default();
+        match waited {
+            Ok(Ok(InputReport {
+                outcome: InputOutcome::NotTyped,
+                error,
+            })) => {
+                let restored = self.store.abort_send(task_id, input_id, previous);
+                let state = match restored {
+                    Ok(true) => "its report is open again".to_string(),
+                    Ok(false) => "its report was replaced or the agent is gone".to_string(),
+                    Err(e) => format!("failed to restore its report: {e}"),
+                };
+                Response::err(format!(
+                    "the reply was not typed into task '{task_id}'{}; {state}",
+                    detail(error)
+                ))
+            }
+            other => {
+                if let Err(e) = self.store.finish_send(task_id, input_id) {
+                    eprintln!("[zelloom-core] failed to finish the reply to task {task_id}: {e}");
+                }
+                match other {
+                    Ok(Ok(InputReport {
+                        outcome: InputOutcome::Typed,
+                        ..
+                    })) => {
+                        let task = self.store.get(task_id).ok().flatten().unwrap_or(task);
+                        Response::ok(serde_json::to_value(&task).unwrap())
+                    }
+                    Ok(Ok(InputReport { error, .. })) => unconfirmed(format!(
+                        "the runner may have typed only part of it{}",
+                        detail(error)
+                    )),
+                    Ok(Err(_)) => unconfirmed("the runner disconnected".to_string()),
+                    Err(_) => unconfirmed(format!(
+                        "the runner did not answer within {} ms",
+                        self.input_timeout.as_millis()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub async fn input_result(
+        &self,
+        attach_id: u64,
+        task_id: &str,
+        input_id: u64,
+        outcome: InputOutcome,
+        error: Option<String>,
+    ) -> Response {
+        let pending = {
+            let mut pending = self.pending_inputs.lock().unwrap();
+            match pending.get(&input_id) {
+                Some(p) if p.attach_id == attach_id && p.task_id == task_id => {
+                    pending.remove(&input_id)
+                }
+                _ => None,
+            }
+        };
+        match pending {
+            Some(p) => {
+                let _ = p.reply.send(InputReport { outcome, error });
+                Response::ok_empty()
+            }
+            None => Response::err(format!(
+                "no reply {input_id} to task '{task_id}' is waiting for a result from this runner"
+            )),
+        }
+    }
+
+    pub async fn agent_gone(&self, workspace: &str, attach_id: u64, task_id: &str) -> Response {
+        let runners = self.runners.lock().await;
+        let is_current = runners
+            .get(workspace)
+            .filter(|h| h.attach_id == attach_id)
+            .is_some_and(|h| h.current_task.as_deref() == Some(task_id));
+        if !is_current {
+            return Response::err(format!(
+                "task '{task_id}' is not the current task of this runner for workspace '{workspace}'"
+            ));
+        }
+        match self.store.reset_turn(task_id) {
+            Ok(Some(task)) => Response::ok(serde_json::to_value(&task).unwrap()),
+            Ok(None) => self.not_running_error(task_id),
+            Err(e) => Response::err(e.to_string()),
         }
     }
 
@@ -296,10 +540,9 @@ impl Scheduler {
     }
 
     async fn finish(self: &Arc<Self>, task_id: &str, status: TaskStatus) -> Response {
-        let task = match self.store.get(task_id) {
-            Ok(Some(t)) => t,
-            Ok(None) => return Response::err(format!("task '{task_id}' not found")),
-            Err(e) => return Response::err(e.to_string()),
+        let task = match self.existing_task(task_id) {
+            Ok(task) => task,
+            Err(response) => return response,
         };
         let allowed = finishable_from(status);
         if !allowed.contains(&task.status) {
@@ -339,11 +582,31 @@ impl Scheduler {
         Response::ok(serde_json::to_value(&updated).unwrap())
     }
 
-    fn current_status(&self, task_id: &str) -> Result<TaskStatus, Response> {
+    fn existing_task(&self, task_id: &str) -> Result<Task, Response> {
         match self.store.get(task_id) {
-            Ok(Some(task)) => Ok(task.status),
-            Ok(None) => Err(Response::err(format!("task '{task_id}' not found"))),
+            Ok(Some(task)) => Ok(task),
+            Ok(None) => Err(task_not_found(task_id)),
             Err(e) => Err(Response::err(e.to_string())),
+        }
+    }
+
+    fn running_task(&self, task_id: &str) -> Result<Task, Response> {
+        let task = self.existing_task(task_id)?;
+        if task.status == TaskStatus::Running {
+            Ok(task)
+        } else {
+            Err(task_not_running(task_id, task.status))
+        }
+    }
+
+    fn current_status(&self, task_id: &str) -> Result<TaskStatus, Response> {
+        self.existing_task(task_id).map(|task| task.status)
+    }
+
+    fn get(&self, task_id: &str) -> Response {
+        match self.existing_task(task_id) {
+            Ok(task) => Response::ok(serde_json::to_value(&task).unwrap()),
+            Err(response) => response,
         }
     }
 
@@ -379,7 +642,7 @@ impl Scheduler {
     ) -> Response {
         match self.store.move_task(task_id, direction) {
             Ok(task) => Response::ok(serde_json::to_value(&task).unwrap()),
-            Err(StoreError::NotFound(id)) => Response::err(format!("task '{id}' not found")),
+            Err(StoreError::NotFound(id)) => task_not_found(&id),
             Err(e) => Response::err(e.to_string()),
         }
     }
@@ -495,17 +758,10 @@ impl Scheduler {
                 "task '{task_id}' is not the current task of the runner for workspace '{workspace}'"
             ));
         }
-        let task = match self.store.get(task_id) {
-            Ok(Some(t)) => t,
-            Ok(None) => return Response::err(format!("task '{task_id}' not found")),
-            Err(e) => return Response::err(e.to_string()),
+        let task = match self.running_task(task_id) {
+            Ok(task) => task,
+            Err(response) => return response,
         };
-        if task.status != TaskStatus::Running {
-            return Response::err(format!(
-                "task '{task_id}' is '{}', not 'running'",
-                task.status.as_str()
-            ));
-        }
         match outcome {
             Outcome::Done | Outcome::Failed => {
                 let new_status = if outcome == Outcome::Done {
@@ -557,6 +813,13 @@ impl Scheduler {
                         self.schedule().await;
                         return Response::err(message);
                     }
+                };
+                if let Err(e) = self.store.reset_turn(task_id) {
+                    eprintln!("[zelloom-core] failed to reset the turn of task {task_id}: {e}");
+                }
+                let task = match self.store.get(task_id) {
+                    Ok(Some(t)) => t,
+                    _ => task,
                 };
                 send_json(
                     &handle.sender,
@@ -665,6 +928,10 @@ impl Scheduler {
             if runners.get(workspace).map(|h| h.attach_id) != Some(attach_id) {
                 return;
             }
+            self.pending_inputs
+                .lock()
+                .unwrap()
+                .retain(|_, p| p.attach_id != attach_id);
             runners.remove(workspace).and_then(|h| h.current_task)
         };
         if let Some(task_id) = interrupted_task
@@ -882,104 +1149,5 @@ impl Scheduler {
                 false
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn task() -> Task {
-        Task {
-            id: "t1".to_string(),
-            text: "text".to_string(),
-            status: TaskStatus::Running,
-            workspace: "w".to_string(),
-            agent: None,
-            source: Source::cli(),
-            reply_to: None,
-            metadata: serde_json::json!({}),
-            position: 1,
-            created_at: "2026-01-01T00:00:00+09:00".to_string(),
-            updated_at: "2026-01-01T00:00:00+09:00".to_string(),
-        }
-    }
-
-    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn env_merge_order_is_agent_then_workspace_then_zelloom() {
-        let agent = AgentConfig {
-            command: vec!["a".into()],
-            instruction_args: None,
-            shell: true,
-            oneshot: false,
-            env: map(&[
-                ("ONLY_AGENT", "agent"),
-                ("BOTH", "agent"),
-                ("ZELLOOM_TASK_ID", "agent"),
-            ]),
-        };
-        let ws = WorkspaceConfig {
-            path: "/tmp/w".into(),
-            agent: None,
-            max_parallel: None,
-            env: map(&[("ONLY_WS", "ws"), ("BOTH", "ws"), ("ZELLOOM_SOCKET", "ws")]),
-        };
-        let env = build_env(&agent, &ws, &task(), "/tmp/s.sock");
-        assert_eq!(
-            env,
-            map(&[
-                ("BOTH", "ws"),
-                ("ONLY_AGENT", "agent"),
-                ("ONLY_WS", "ws"),
-                ("ZELLOOM_SOCKET", "/tmp/s.sock"),
-                ("ZELLOOM_TASK_ID", "t1"),
-                ("ZELLOOM_WORKSPACE", "w"),
-            ])
-        );
-    }
-
-    #[test]
-    fn instruction_args_embed_instruction_before_task_text() {
-        let agent = AgentConfig {
-            command: vec!["codex".into()],
-            instruction_args: Some(vec![
-                "-c".into(),
-                "developer_instructions={instruction}".into(),
-            ]),
-            shell: true,
-            oneshot: false,
-            env: BTreeMap::new(),
-        };
-        assert_eq!(
-            build_argv(&agent, "be nice\n", "fix it"),
-            vec![
-                "codex".to_string(),
-                "-c".to_string(),
-                "developer_instructions=be nice\n".to_string(),
-                "fix it".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn oneshot_passes_only_task_text() {
-        let agent = AgentConfig {
-            command: vec!["claude".into(), "-p".into()],
-            instruction_args: None,
-            shell: true,
-            oneshot: true,
-            env: BTreeMap::new(),
-        };
-        assert_eq!(
-            build_argv(&agent, "be nice\n", "fix it"),
-            vec!["claude".to_string(), "-p".to_string(), "fix it".to_string()]
-        );
     }
 }

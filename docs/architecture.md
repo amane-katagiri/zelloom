@@ -11,7 +11,7 @@ zelloom（バイナリ名 `loom`）は、対話型コーディングエージェ
 | core | `loom core`（通常は `loom` がデタッチ起動。`loom stop` で停止） | Unix socket サーバ。タスクの永続化（SQLite）、グローバルキュー、scheduler、runner への指示を持つ唯一の状態所有者 |
 | runner | `loom runner <workspace>`（core が Zellij タブで起動） | workspace タブに常駐し、タスクごとにエージェントを子プロセス（別プロセスグループ）として起動・停止する |
 | TUI | 素の `loom`（実行した端末・ペインでそのまま動く） | core をポーリングして一覧表示し、操作をリクエストとして送るだけのクライアント |
-| CLI | `loom add` / `loom done` / `loom list` / `loom stop` / `loom init` / `loom config edit` / `loom workspace ...` | 1 リクエスト 1 応答のクライアント。`init`・`config`・`workspace` は core を介さず設定ファイルを直接読み書きする。内部用の `core` と `runner` は `--help` に出さない |
+| CLI | `loom add [--source T]` / `loom done` / `loom list [--json]` / `loom show <id> [--json]` / `loom report <kind> [message] [--task id]` / `loom turn <busy\|idle> [--task id]` / `loom send <id> --expect <attention.id> [text]` / `loom watch` / `loom stop` / `loom init` / `loom config edit` / `loom workspace ...` | 1 リクエスト 1 応答のクライアント（`loom watch` だけは watch 接続を張り、届いた行をそのまま出し続ける）。`init`・`config`・`workspace` は core を介さず設定ファイルを直接読み書きする。内部用の `core` と `runner` は `--help` に出さない |
 | Zellij launcher | core 内（`launcher.rs`） | runner が未接続の workspace に対し、`zellij action` でタブを作って runner を起動する |
 | HTTP アダプタ | core 内（`http.rs`）。設定に `[http]` があるときだけ起動 | `POST /tasks` を受け付け、core 自身の Unix socket にクライアントとして `enqueue` を送るだけ。Scheduler は直接呼ばない |
 
@@ -36,9 +36,12 @@ zelloom（バイナリ名 `loom`）は、対話型コーディングエージェ
 ```
 
 - クライアント（CLI / TUI / `loom done`）は接続ごとに JSON を 1 行送り、1 行受け取る。
-- runner は `runner_attach` で長寿命接続を張り、core から `start` / `stop` イベントを受け、`agent_exited` を送る。
+- runner は `runner_attach` で長寿命接続を張り、core から `start` / `stop` / `input` イベントを受け、`agent_exited` / `agent_gone` / `input_result` を送る。
+- 監督役の外部プロセス（別のエージェントのセッションなど）は `loom watch`（`watch` 接続）でタスクの変化を受け取り続ける。agent は `loom report` で今なにを待っているか（`attention`）を報告し、agent の hook は `loom turn` でターンの途中か入力欄で待っているか（`turn`）を知らせる。監督役は `loom send --expect <attention.id>` で、報告のあとにターンを終えた agent にだけ返信を打ち込ませ、runner が打ち込めたことを確かめてから応答を受け取る。判断はすべて監督役が行い、zelloom は状態とメッセージを運ぶだけ（[protocol.md](architecture/protocol.md#watch-接続)、[scheduler.md](architecture/scheduler.md#attention)、[runner.md](architecture/runner.md#返信の入力)）。
 - core は runner が未接続の workspace にタスクを割り当てると、Zellij にタブを作って runner を起動し、接続を待つ。
-- CLI（`loom add` / `loom done` / `loom list`）は、ソケットが無い・接続を拒否されたとき `loom core is not running (<socket>); start it with `loom` inside a Zellij session` を表示して非 0 で終了する（`client::ClientError::CoreNotRunning`）。
+- CLI（`loom add` / `loom done` / `loom list` / `loom show` / `loom report` / `loom turn` / `loom send` / `loom watch`）は、ソケットが無い・接続を拒否されたとき `loom core is not running (<socket>); start it with `loom` inside a Zellij session` を表示して非 0 で終了する（`client::ClientError::CoreNotRunning`）。
+- `loom list` と `loom show`（`--json` なし）は、本文・報告・各項目の LF 以外の C0 制御文字、DEL、C1 制御文字を `\x1b` / `\u{9b}` の形に直して表示する（`show` の項目の値では LF も `\n`）。`--json` の出力はそのまま。
+- `loom watch` は、core が接続を閉じたら（`shutdown` や遅れによる切断）`connection to loom core closed; run `loom watch` again to resync` を表示して非 0 で終了する。読み続ける側は起動し直してスナップショットから取り直す。
 - `loom stop` は `shutdown` を送り、ソケットが接続を受け付けなくなるまで最大 5 秒待つ。core が動いていなければ `core is not running` を表示して正常終了する。`--force` が無ければ `running` のタスクがあるとき拒否され、そのタスク（workspace・本文・ID）を表示して非 0 で終了する。TUI は終了時に core も止めるかを確認する（[tui.md](architecture/tui.md)）。
 - 詳細: [protocol.md](architecture/protocol.md) / [scheduler.md](architecture/scheduler.md) / [runner.md](architecture/runner.md) / [zellij.md](architecture/zellij.md) / [http.md](architecture/http.md)
 
@@ -48,24 +51,26 @@ zelloom（バイナリ名 `loom`）は、対話型コーディングエージェ
 |---|---|---|
 | `src/main.rs` | clap でパースして `cli::dispatch` を呼ぶだけ | — |
 | `src/lib.rs` | モジュール宣言 | — |
-| `src/cli.rs` | サブコマンド定義と実装。素の `loom`（必要なら core をデタッチ起動してから、その場で TUI を実行）、`loom stop`、`loom config edit` | [zellij.md](architecture/zellij.md)、[config.md](architecture/config.md) |
+| `src/cli/mod.rs` | サブコマンド定義とディスパッチ。素の `loom`（必要なら core をデタッチ起動してから、その場で TUI を実行）、`loom stop`、`loom init`、`loom config edit`、`loom workspace` | [zellij.md](architecture/zellij.md)、[config.md](architecture/config.md) |
+| `src/cli/tasks.rs` | タスクを扱うコマンド（`add` / `done` / `list` / `show` / `report` / `turn` / `send` / `watch`）、引数または標準入力からの本文、source の検査、`show` と `list` の端末向けの制御文字のエスケープ | [protocol.md](architecture/protocol.md) |
 | `src/editor.rs` | エディタの解決と起動（`loom config edit`、TUI と runner の複数行入力で共用）、一時ファイルでの本文入力 | [config.md](architecture/config.md)、[tui.md](architecture/tui.md)、[runner.md](architecture/runner.md) |
 | `src/paths.rs` | 設定・状態・ソケットのパス解決と `--socket` の上書き、上書きを無視した既定ソケット | [config.md](architecture/config.md) |
 | `src/config.rs` | 設定の読み込み・検証、agent 解決、`init` のテンプレート書き込み、`workspace add` のパス・ID 決定と書き込み、cwd からの workspace 自動判定 | [config.md](architecture/config.md) |
-| `src/protocol.rs` | リクエスト・応答・runner イベント・`Task` の型 | [protocol.md](architecture/protocol.md) |
-| `src/client.rs` | 同期 Unix socket クライアント | [protocol.md](architecture/protocol.md) |
-| `src/store.rs` | SQLite の `tasks` テーブルと操作 | [scheduler.md](architecture/scheduler.md) |
-| `src/core/mod.rs` | core サーバ（既存ソケットの確認、ソケット待ち受け、接続ごとの処理、起動時の interrupted 化） | [protocol.md](architecture/protocol.md) |
-| `src/core/scheduler.rs` | 各操作の実装、スケジューリング、runner 管理、attach タイムアウト、agent の argv・環境変数の組み立て、`TabLauncher` トレイトとテスト用の `NoopLauncher` | [scheduler.md](architecture/scheduler.md)、[config.md](architecture/config.md) |
+| `src/protocol.rs` | リクエスト・応答・runner イベント・watch イベント・`Task` と `Attention` の型 | [protocol.md](architecture/protocol.md) |
+| `src/client.rs` | 同期 Unix socket クライアント（`loom watch` 用の生の行読み出しを含む） | [protocol.md](architecture/protocol.md) |
+| `src/store.rs` | SQLite の `tasks` テーブルと操作、メモリ上の `attention` と turn の記録・通し番号、`send` の受け付けと取り消し、watch イベントの送信と購読 | [scheduler.md](architecture/scheduler.md) |
+| `src/core/mod.rs` | core サーバ（既存ソケットの確認、ソケット待ち受け、リクエスト行の読み取りと上限、接続ごとの処理、runner 接続、時間制限付きの watch 接続、起動時の interrupted 化） | [protocol.md](architecture/protocol.md) |
+| `src/core/scheduler.rs` | 各操作の実装（`report` / `turn` / `send`、`input_result` 待ち、`agent_gone` を含む）、スケジューリング、runner 管理、attach タイムアウト、`TabLauncher` トレイトとテスト用の `NoopLauncher` | [scheduler.md](architecture/scheduler.md) |
+| `src/core/agent.rs` | agent の argv・環境変数・instruction の組み立て、`send` の本文と `report` の本文の検査（状態を持たない関数） | [config.md](architecture/config.md)、[protocol.md](architecture/protocol.md#send-の本文) |
 | `src/launcher.rs` | `TabLauncher` の Zellij 実装（runner ペイン・管理 TUI ペインの判定、タブの再利用・作り直し判定、新しいタブを管理タブの隣へ移す） | [zellij.md](architecture/zellij.md) |
 | `src/http.rs` | HTTP アダプタ（`POST /tasks`、Host/Origin チェック、CORS、core 自身の Unix socket へのクライアント呼び出し） | [http.md](architecture/http.md) |
-| `src/zellij.rs` | `zellij --session <name> action ...` の薄いラッパ | [zellij.md](architecture/zellij.md) |
-| `src/runner.rs` | runner 本体（待機中の端末からのタスク入力とエディタでの複数行入力、シェル経由の起動、ジョブ制御、端末復元、停止シーケンス、自発終了時のプロンプト、正常終了時に自分のペインを閉じる） | [runner.md](architecture/runner.md) |
+| `src/zellij.rs` | `zellij --session <name> action ...` の薄いラッパ（返信の打ち込みは時間制限付き） | [zellij.md](architecture/zellij.md) |
+| `src/runner.rs` | runner 本体（待機中の端末からのタスク入力とエディタでの複数行入力、シェル経由の起動、ジョブ制御、端末復元、停止シーケンス、`input` の返信を別スレッドで自分のペインに打ち込み `input_result` を返す処理、自発終了時の `agent_gone` と未読入力の破棄とプロンプト、正常終了時に自分のペインを閉じる） | [runner.md](architecture/runner.md) |
 | `src/tui/mod.rs` | TUI のイベントループ、core 呼び出し、タブへのフォーカス | [tui.md](architecture/tui.md) |
 | `src/tui/app.rs` | TUI の状態とキー処理 | [tui.md](architecture/tui.md) |
 | `src/tui/ui.rs` | TUI の描画 | [tui.md](architecture/tui.md) |
-| `tests/scheduler_flow.rs` | core を実ソケットで起動し、偽 runner で scheduler の流れを検証する結合テスト（`loom stop` 相当の停止と `cli::ensure_core` も含む） | — |
-| `tests/runner_pty.rs` | pty の上で実際の `loom runner` を動かし、シェル経由の起動・rc ファイル・環境変数・argv・`loom done` による停止・待機中の端末からのタスク入力（エディタ経由の複数行を含む）を検証する結合テスト（手元に無いシェルは飛ばす） | [runner.md](architecture/runner.md) |
+| `tests/scheduler_flow.rs` | core を実ソケットで起動し、偽 runner で scheduler の流れを検証する結合テスト（`attention`・`turn`・watch 接続・`send` の受け付け条件と配送結果・`agent_gone` を含む。`loom stop` 相当の停止と `cli::ensure_core` も含む） | — |
+| `tests/runner_pty.rs` | pty の上で実際の `loom runner` を動かし、シェル経由の起動・rc ファイル・環境変数・argv・`loom done` による停止・待機中の端末からのタスク入力（エディタ経由の複数行を含む）・`input` による偽 `zellij` の呼び出しと結果・止まった `zellij` の時間切れと並行する停止・待機中の `input` の拒否・agent 終了後の未読入力の破棄を検証する結合テスト（手元に無いシェルは飛ばす） | [runner.md](architecture/runner.md) |
 | `tests/http_adapter.rs` | core を `[http]` 付きの実ソケットで起動し、生の HTTP/1.1 リクエストで `POST /tasks`・Host/Origin チェック・CORS・core 終了時の停止を検証する結合テスト | [http.md](architecture/http.md) |
 
 ## 設定とパスの要約

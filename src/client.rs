@@ -69,8 +69,19 @@ impl Client {
         Ok(serde_json::from_str(line.trim_end())?)
     }
 
+    pub fn read_raw_line(&mut self) -> Result<Option<String>, ClientError> {
+        let mut line = String::new();
+        if self.reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        Ok(Some(line))
+    }
+
     pub fn call(&mut self, request: &Request) -> Result<Response, ClientError> {
-        self.write_request(request)?;
+        if let Err(write_error) = self.write_request(request) {
+            // core answers an oversized request and closes before reading all of it
+            return self.read_response().map_err(|_| write_error);
+        }
         self.read_response()
     }
 

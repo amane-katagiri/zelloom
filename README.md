@@ -183,16 +183,21 @@ loom stop
 | コマンド | 説明 |
 |---|---|
 | `loom` | core が動いていなければ起動し、管理画面を開きます |
-| `loom add [-w WORKSPACE] [--agent AGENT] [本文]` | タスクを追加します。本文を省略すると標準入力から読みます。`--agent` でこのタスクだけ使うエージェントを変えられます |
+| `loom add [-w WORKSPACE] [--agent AGENT] [--source TYPE] [本文]` | タスクを追加します。本文を省略すると標準入力から読みます。`--agent` でこのタスクだけ使うエージェントを変えられます。`--source` はタスクの `source.type`（既定 `cli`）で、`[sources.<TYPE>] auto_queue = false` と組み合わせて外部プロセスからの追加を受信止まりにできます（空文字列・空白や制御文字を含むものはエラー） |
 | `loom done [タスクID]` | タスクを完了にします。エージェントのセッション内では ID を省略できます |
-| `loom list` | タスクの一覧を表示します |
+| `loom list [--json]` | タスクの一覧を表示します。`--json` で 1 行の JSON 配列にします。端末を乱す制御文字は `\x1b` のような見える形にして表示します |
+| `loom show <タスクID> [--json]` | タスク 1 件の全項目と本文全体を表示します（制御文字は `list` と同じく見える形にします）。ID が無ければエラーです |
+| `loom report <種類> [メッセージ] [--task ID]` | 実行中のタスクが今なにを待っているかを報告します（種類は `question` / `gate` / `blocked` / `ready`）。メッセージを省略すると標準入力から読みます。エージェントのセッション内では ID を省略できます |
+| `loom turn <busy\|idle> [--task ID]` | エージェントがターンの途中か、ターンを終えて入力を待っているかを知らせます。エージェントの hook から呼ぶためのコマンドで、成功しても何も表示しません |
+| `loom send <タスクID> --expect <報告ID> [本文]` | `question` / `gate` / `ready` を報告し、そのあとターンを終えたタスクのエージェントに本文を打ち込み、Enter を押します。`--expect` には返信する報告の `attention.id` を渡します。本文を省略すると標準入力から読みます |
+| `loom watch` | タスクの変化を JSON Lines で流し続けます。core との接続が切れたら非 0 で終了します |
 | `loom stop [--force]` | core を止めます |
 | `loom init` | 設定ファイルのひな形を作ります |
 | `loom config edit` | 設定ファイルをエディタ（`$VISUAL` → `$EDITOR` → `vi`）で開き、閉じたあとに内容を検査します |
 | `loom workspace add [ID] [--path パス] [--agent AGENT]` | workspace を登録します |
 | `loom workspace list` | 登録済みの workspace を表示します |
 
-`loom add`・`loom done`・`loom list` は core が動いていないと使えません。先に Zellij の中で `loom` を起動してください。
+`loom add`・`loom done`・`loom list`・`loom show`・`loom report`・`loom turn`・`loom send`・`loom watch` は core が動いていないと使えません。先に Zellij の中で `loom` を起動してください。
 
 どのコマンドにも `--socket <パス>` を付けて、接続する core を指定できます（[環境変数](#環境変数とファイルの場所)も参照）。
 
@@ -231,6 +236,7 @@ instruction_args = ["-c", "developer_instructions={instruction}"]
 | `scheduler.max_parallel` | `4` | 全 workspace を合わせて同時に実行するタスクの上限 |
 | `agents.<名前>.command` | （必須） | エージェントを起動するコマンド |
 | `agents.<名前>.instruction_args` | なし | zelloom からの指示をエージェントに渡すための引数 |
+| `agents.<名前>.instruction` | なし | zelloom からの指示の本文を置き換える（`{loom_exe}` は loom のパスになる。`oneshot` とは併用不可） |
 | `agents.<名前>.shell` | `true` | ログインしたときと同じシェル経由で起動するか |
 | `agents.<名前>.oneshot` | `false` | 対話せずに 1 回実行して終わるエージェントとして扱うか |
 | `agents.<名前>.env` | なし | エージェントに渡す環境変数 |
@@ -276,6 +282,8 @@ zelloom は起動するエージェントに、「1 タスク 1 セッション�
 - Codex なら `-c developer_instructions=...` で developer メッセージとして渡します。
 
 `instruction_args` を書く場合は、どこかに必ず `{instruction}` を含めてください（無いと設定エラーになります）。
+
+指示の本文そのものを変えたいときは `instruction` に書きます。中の `{loom_exe}` は loom 実行ファイルのパスに置き換わります。`oneshot = true` とは同時に指定できません（[詳細](docs/architecture/config.md)）。
 
 システムプロンプトを渡す手段を持たないエージェントでは、`instruction_args` を省略します。その場合、指示はタスク本文の前に改行でつないで、ひとつの引数として渡されます。
 
@@ -347,9 +355,10 @@ env = { RUST_LOG = "debug" }
 
 | 変数 | 中身 |
 |---|---|
-| `ZELLOOM_TASK_ID` | 実行中のタスクの ID（`loom done` で ID を省略できるのはこのためです） |
+| `ZELLOOM_TASK_ID` | 実行中のタスクの ID（`loom done` や `loom report` で ID を省略できるのはこのためです） |
 | `ZELLOOM_WORKSPACE` | workspace の ID |
 | `ZELLOOM_SOCKET` | core の接続先 |
+| `ZELLOOM_LOOM_EXE` | loom 実行ファイルの絶対パス（hook から `PATH` に頼らず loom を呼ぶため） |
 
 ### workspace ごとの設定
 
@@ -415,6 +424,14 @@ allowed_origins = ["http://localhost:5173"]
 
 `[http]` を設定すると、core の中に `POST /tasks` だけを受け付ける HTTP サーバが立ち上がります。`listen` は loopback アドレス（`127.0.0.1` や `[::1]`）に限られ、ブラウザから叩く場合は `allowed_origins` にその Origin を登録します。詳しいセキュリティ上の仕組みは [docs/architecture/http.md](docs/architecture/http.md) を参照してください。`[http]` の変更は core の再起動後に反映されます。
 
+### 別のエージェントからワーカーを見守る
+
+zelloom の外にいる「監督役」（別の Claude Code のセッションなど）が、zelloom で動くエージェントたちを見守れます。判断するのは監督役で、zelloom は報告と返信を運ぶだけです。
+
+- ワーカーは `loom report <種類>` で手が止まった理由を報告し、hook から `loom turn` でターンの状態を知らせます。
+- 監督役は `loom watch` で報告と状態の変化を受け取り、`loom send <タスクID> --expect <報告ID> "返信"` で返信します。
+- プロトコルの詳細（`watch` の形式、報告の寿命、`send` を受け付ける条件と本文の規則）は [docs/architecture/protocol.md](docs/architecture/protocol.md#watch-接続) と [docs/architecture/scheduler.md](docs/architecture/scheduler.md#attention) にあります。
+
 ### 環境変数とファイルの場所
 
 | 用途 | 既定の場所 | 変更するには |
@@ -424,6 +441,8 @@ allowed_origins = ["http://localhost:5173"]
 | core との接続（ソケット） | `$XDG_RUNTIME_DIR/zelloom/default.sock`（未設定なら `/tmp/zelloom-<uid>/default.sock`） | `--socket` または `ZELLOOM_SOCKET` |
 | `zellij` コマンド | `PATH` にある `zellij` | `ZELLOOM_ZELLIJ` |
 | タブが立ち上がるまでの待ち時間 | 20 秒 | `ZELLOOM_ATTACH_TIMEOUT_MS`（ミリ秒） |
+| `loom send` が打ち込みの結果を待つ時間 | 15 秒 | `ZELLOOM_INPUT_TIMEOUT_MS`（ミリ秒） |
+| `loom watch` への 1 回の書き込みの時間制限 | 10 秒 | `ZELLOOM_WATCH_WRITE_TIMEOUT_MS`（ミリ秒） |
 
 - タブを作ってからエージェントの準備ができるまでに待ち時間を超えると、そのタスクは中断扱いになります。マシンが遅くてよく中断されるようなら、`ZELLOOM_ATTACH_TIMEOUT_MS` を長めにしてください。この値は core の起動時に読まれます。
 - core のログは、`loom` が core を裏で起動したときだけ `core.log` に書かれます。タスクが失敗したときの理由などはここで確認できます。

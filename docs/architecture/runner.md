@@ -10,7 +10,7 @@
 4. `/dev/tty` を開く。開けたら入力用に保持する。
 5. `zelloom runner: <workspace> — waiting for tasks` を表示して待つ。端末を保持している場合は続けて `type a task and press Enter to queue it for <workspace>`、`press Enter on an empty line twice to write a multi-line task in an editor` と入力プロンプト `> ` を表示する。
 
-ソケットの読み取り、agent の `wait`、シグナル受信はそれぞれ別スレッドで行い、1 本の `mpsc` チャネルに流す。待機中に届いた `stop` や応答行は捨てる。ただしエラー応答（`agent_exited` が拒否された場合など）は内容を表示してから捨てる。
+ソケットの読み取り、agent の `wait`、シグナル受信、返信の打ち込み（[下記](#返信の入力)）はそれぞれ別スレッドで行い、1 本の `mpsc` チャネルに流す。待機中に届いた `stop` や応答行は捨てる。ただしエラー応答（`agent_exited` が拒否された場合など）は内容を表示してから捨てる。待機中に届いた `input` は打ち込まず、`[zelloom-runner] did not type a reply for task <id>: no agent is running here` を表示して、すぐに `input_result`（`not_typed`）を返す。
 
 ## 待機中のタスク入力
 
@@ -29,7 +29,7 @@
 - エディタを開いている間はチャネルを見ない。その間に届いた `start` などはエディタを閉じてから処理する。
 - `sources.runner.auto_queue`（[config.md](config.md)）は他の source と同じく効く。
 - `poll` が失敗した、端末が読めなくなった（`POLLHUP` など）、`read` が失敗した場合はエラーを表示し、以後は入力を受け付けずチャネルだけを待つ。
-- `start` を受けたら、agent を起動する前に端末の未読入力を `tcflush(TCIFLUSH)` で捨てる。確定前の入力が agent に渡らないようにするため。
+- `start` を受けたら、agent を起動する前に端末の未読入力を `tcflush(TCIFLUSH)` で捨てる。確定前の入力が agent に渡らないようにするため。agent の実行が終わって待機中の入力に戻る前にも同じく捨てる。
 
 ## タスクの実行
 
@@ -59,7 +59,33 @@
 - 自分のタスクの `stop` を受けたら、agent のプロセスグループに SIGTERM を送り、3 秒の猶予を置く。
 - 猶予内に終了しなければプロセスグループに SIGKILL を送り、終了を待つ。
 - SIGHUP / SIGTERM を runner が受けたときも同じ手順で agent を止める（すでに猶予中なら何もしない）。
-- 他のタスク宛ての `start` など、待機中に関係ないメッセージが届いた場合は捨てずに保留し、待機が終わったあとに処理する。
+- 他のタスク宛ての `start` など、待機中に関係ないメッセージが届いた場合は捨てずに保留し、待機が終わったあとに処理する。`input` は保留せずにその場で処理する（[下記](#返信の入力)）。
+- 待機は、agent が終了し、かつ打ち込み中の返信が無くなったときに終わる。打ち込みのスレッドが動いている間に agent が終了しても、その結果（各呼び出しの時間制限で抑えられる）を待ってから先へ進む。猶予中の SIGKILL は、agent がまだ終了していないときだけ送る。
+
+## 返信の入力
+
+agent の終了を待っている間に `input`（[protocol.md](protocol.md#core--runner-イベント)）を受けると、runner は次のどれかなら打ち込まずに `input_result`（`not_typed`、`error` に理由）をすぐ返す: 実行中のタスク宛てでない、停止シーケンス中（`stop` か SIGHUP / SIGTERM を受けた）、agent がすでに終了している、別の返信を打ち込み中。自発終了時のプロンプト中と待機中に届いた `input` も同じく `not_typed` を返す。
+
+それ以外なら、別スレッドで Zellij の CLI を使って自分のペインに文字を打ち込む（`type_into_own_pane`）。待機ループはその間も `stop`・SIGHUP / SIGTERM・agent の終了を処理し続ける。
+
+1. `zellij --session $ZELLIJ_SESSION_NAME action write-chars --pane-id $ZELLIJ_PANE_ID -- <text>`
+2. `zellij --session $ZELLIJ_SESSION_NAME action write --pane-id $ZELLIJ_PANE_ID 13`（Enter）
+
+- それぞれ 5 秒の時間制限付きで呼ぶ（超えたら `zellij` を kill する。[zellij.md](zellij.md)）。
+- 結果はチャネル経由で待機ループに戻り、runner が `input_result` を送る。
+
+| 結果 | `outcome` |
+|---|---|
+| 1 と 2 が成功 | `typed` |
+| `ZELLIJ_SESSION_NAME` か `ZELLIJ_PANE_ID` が無い、1 が起動できない・非 0 で終了した | `not_typed` |
+| 1 が時間切れ | `partial` |
+| 1 は成功し、2 が失敗・時間切れ | `partial` |
+
+- 失敗したときはペインにも理由を表示する。
+- ペインのフォアグラウンドは agent なので、打ち込んだ文字は agent の入力になる。runner 自身は端末を読まない。
+- Enter は本文とは別の `write` で送る。本文中の LF は入力欄の改行のまま打ち込むので、複数行の返信は 1 回の送信になる。
+- 本文の前に `--` を置く。
+- `zellij` は `ZELLOOM_ZELLIJ` で差し替えられる（[zellij.md](zellij.md)）。
 
 ## 終了後の分岐
 
@@ -73,6 +99,14 @@
 | agent が自分で終了した（上記以外）で `agent.oneshot` が false | プロンプトを出す（下記） |
 
 ## 自発終了時のプロンプト
+
+agent が自分で終了したとき（`stop`・SIGHUP / SIGTERM・切断のどれでもないとき）、runner は端末を戻したあと、プロンプトや oneshot の結果より先に次を行う。
+
+1. `agent_gone` を送る（core が attention を消し、turn を `busy` にするので、以後 `send` は通らない）。
+2. 直前に返信を打ち込んでいれば、最後の打ち込みから 300ms 経つまで待つ。
+3. 端末の未読入力を `tcflush(TCIFLUSH)` で捨てる。
+
+`stop` で終わった場合も 2 と 3 を行ってから待機に戻る。
 
 agent が `loom done` なしで終了すると、runner は端末に次を表示し、端末を raw モードにして 1 文字を待つ。
 

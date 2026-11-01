@@ -15,7 +15,13 @@ use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd::{self, Pid};
 
-use crate::protocol::{Outcome, Request, ResolvedAgent, RunnerEvent, ServerMessage, Source, Task};
+use crate::protocol::{
+    InputOutcome, Outcome, Request, ResolvedAgent, RunnerEvent, ServerMessage, Source, Task,
+};
+
+const TYPE_TIMEOUT: Duration = Duration::from_secs(5);
+// Zellij hands typed bytes to the pty asynchronously after `zellij action` returns, so a flush right after typing could run before they arrive.
+const TYPED_INPUT_SETTLE: Duration = Duration::from_millis(300);
 
 static TERM_PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -37,6 +43,15 @@ enum RunnerMsg {
     ServerClosed,
     ChildExited(std::io::Result<ExitStatus>),
     TermSignal,
+    Typed(TypingDone),
+}
+
+#[derive(Debug)]
+struct TypingDone {
+    task_id: String,
+    input_id: u64,
+    outcome: InputOutcome,
+    error: Option<String>,
 }
 
 // Core can send `Start` for the next task right after `Stop` for this one, so a wait loop watching one task's outcome must be able to push an unrelated message back instead of dropping it.
@@ -128,11 +143,13 @@ pub fn run(workspace: String) -> anyhow::Result<()> {
                     let _ = termios::tcflush(tty, termios::FlushArg::TCIFLUSH);
                 }
                 editor_armed = false;
-                if run_task(task, agent, &mut writer, &mut rx, &tx) {
-                    print_idle_banner(&workspace, input.is_some());
-                } else {
+                if !run_task(task, agent, &mut writer, &mut rx, &tx) {
                     return Ok(());
                 }
+                if let Some(tty) = &input {
+                    let _ = termios::tcflush(tty, termios::FlushArg::TCIFLUSH);
+                }
+                print_idle_banner(&workspace, input.is_some());
             }
             Ok(RunnerMsg::ServerClosed) => {
                 eprintln!("[zelloom-runner] connection to loom core lost");
@@ -145,20 +162,96 @@ pub fn run(workspace: String) -> anyhow::Result<()> {
                     resp.error.unwrap_or_default()
                 );
             }
+            Ok(RunnerMsg::Server(ServerMessage::Event(RunnerEvent::Input {
+                task_id,
+                input_id,
+                ..
+            }))) => {
+                refuse_input(&mut writer, &task_id, input_id, "no agent is running here");
+            }
             Ok(_) => {}
             Err(_) => return Ok(()),
         }
     }
 }
 
+fn send_input_result(writer: &mut UnixStream, done: TypingDone) {
+    if let Err(e) = send_request(
+        writer,
+        &Request::InputResult {
+            task_id: done.task_id,
+            input_id: done.input_id,
+            outcome: done.outcome,
+            error: done.error,
+        },
+    ) {
+        eprintln!("[zelloom-runner] failed to report the reply delivery to core: {e}");
+    }
+}
+
+fn refuse_input(writer: &mut UnixStream, task_id: &str, input_id: u64, reason: &str) {
+    eprintln!("[zelloom-runner] did not type a reply for task {task_id}: {reason}");
+    send_input_result(
+        writer,
+        TypingDone {
+            task_id: task_id.to_string(),
+            input_id,
+            outcome: InputOutcome::NotTyped,
+            error: Some(reason.to_string()),
+        },
+    );
+}
+
+fn spawn_typing(tx: mpsc::Sender<RunnerMsg>, task_id: String, input_id: u64, text: String) {
+    std::thread::spawn(move || {
+        let (outcome, error) = type_into_own_pane(&text);
+        if let Some(e) = &error {
+            eprintln!("[zelloom-runner] failed to type the reply into the pane: {e}");
+        }
+        let _ = tx.send(RunnerMsg::Typed(TypingDone {
+            task_id,
+            input_id,
+            outcome,
+            error,
+        }));
+    });
+}
+
+fn own_pane() -> Option<(crate::zellij::Zellij, String)> {
+    let session = std::env::var("ZELLIJ_SESSION_NAME").ok()?;
+    let pane_id = std::env::var("ZELLIJ_PANE_ID").ok()?;
+    Some((crate::zellij::Zellij::new(session), pane_id))
+}
+
+fn type_into_own_pane(text: &str) -> (InputOutcome, Option<String>) {
+    let Some((zellij, pane_id)) = own_pane() else {
+        return (
+            InputOutcome::NotTyped,
+            Some("ZELLIJ_SESSION_NAME or ZELLIJ_PANE_ID is not set".to_string()),
+        );
+    };
+    match zellij.write_chars(&pane_id, text, TYPE_TIMEOUT) {
+        Ok(()) => {}
+        Err(e @ crate::zellij::ZellijError::Timeout(_)) => {
+            return (InputOutcome::Partial, Some(format!("write-chars: {e}")));
+        }
+        Err(e) => return (InputOutcome::NotTyped, Some(format!("write-chars: {e}"))),
+    }
+    // Enter goes as a separate raw write because a newline inside write-chars only adds a line to the agent's input box.
+    match zellij.write_bytes(&pane_id, b"\r", TYPE_TIMEOUT) {
+        Ok(()) => (InputOutcome::Typed, None),
+        Err(e) => (
+            InputOutcome::Partial,
+            Some(format!("the text was typed but Enter was not: {e}")),
+        ),
+    }
+}
+
 pub fn close_own_pane() {
-    let (Ok(session), Ok(pane_id)) = (
-        std::env::var("ZELLIJ_SESSION_NAME"),
-        std::env::var("ZELLIJ_PANE_ID"),
-    ) else {
+    let Some((zellij, pane_id)) = own_pane() else {
         return;
     };
-    if let Err(e) = crate::zellij::Zellij::new(session).close_pane(&format!("terminal_{pane_id}")) {
+    if let Err(e) = zellij.close_pane(&format!("terminal_{pane_id}")) {
         eprintln!("[zelloom-runner] failed to close the pane: {e}");
     }
 }
@@ -493,8 +586,13 @@ fn run_task(
         eprintln!("[zelloom-runner] failed to move agent to the foreground: {e}");
     }
 
-    let (exit_status, stop_requested, server_closed, term_signal) =
-        wait_for_agent(child, pid, &task.id, rx, tx);
+    let AgentWait {
+        exit_status,
+        stop_requested,
+        server_closed,
+        term_signal,
+        last_typed,
+    } = wait_for_agent(child, pid, &task.id, rx, tx, writer);
 
     restore_terminal(&tty, saved_termios.as_ref(), runner_pgid);
 
@@ -506,6 +604,7 @@ fn run_task(
         return false;
     }
     if stop_requested {
+        flush_typed_input(&tty, last_typed);
         if server_closed {
             eprintln!("[zelloom-runner] connection to loom core lost");
             return false;
@@ -517,10 +616,20 @@ fn run_task(
         return false;
     }
 
+    if let Err(e) = send_request(
+        writer,
+        &Request::AgentGone {
+            task_id: task.id.clone(),
+        },
+    ) {
+        eprintln!("[zelloom-runner] failed to tell core that the agent exited: {e}");
+    }
+    flush_typed_input(&tty, last_typed);
+
     let prompt = if agent.oneshot {
         PromptResult::Outcome(oneshot_outcome(&exit_status))
     } else {
-        match prompt_outcome(&tty, &task.id, rx) {
+        match prompt_outcome(&tty, &task.id, rx, writer) {
             Ok(prompt) => prompt,
             Err(e) => {
                 eprintln!("[zelloom-runner] failed to ask for the task outcome: {e:#}");
@@ -548,13 +657,33 @@ fn run_task(
     }
 }
 
+fn flush_typed_input(tty: &File, last_typed: Option<Instant>) {
+    if let Some(at) = last_typed {
+        let settle_until = at + TYPED_INPUT_SETTLE;
+        let now = Instant::now();
+        if settle_until > now {
+            std::thread::sleep(settle_until - now);
+        }
+    }
+    let _ = termios::tcflush(tty, termios::FlushArg::TCIFLUSH);
+}
+
+struct AgentWait {
+    exit_status: std::io::Result<ExitStatus>,
+    stop_requested: bool,
+    server_closed: bool,
+    term_signal: bool,
+    last_typed: Option<Instant>,
+}
+
 fn wait_for_agent(
     mut child: Child,
     pid: Pid,
     task_id: &str,
     rx: &mut EventStream,
     tx: &mpsc::Sender<RunnerMsg>,
-) -> (std::io::Result<ExitStatus>, bool, bool, bool) {
+    writer: &mut UnixStream,
+) -> AgentWait {
     let waiter_tx = tx.clone();
     std::thread::spawn(move || {
         let status = child.wait();
@@ -565,31 +694,34 @@ fn wait_for_agent(
     let mut server_closed = false;
     let mut term_signal = false;
     let mut deadline: Option<Instant> = None;
+    let mut exited: Option<std::io::Result<ExitStatus>> = None;
+    let mut typing: Option<u64> = None;
+    let mut last_typed: Option<Instant> = None;
     // Unrelated messages must not be dropped, but re-reading them here via `rx.recv()` would spin forever, so they're only handed back to `rx` once this loop is done waiting.
     let mut deferred: Vec<RunnerMsg> = Vec::new();
 
     let exit_status = loop {
+        if typing.is_none()
+            && let Some(status) = exited.take()
+        {
+            break status;
+        }
         let msg = match deadline {
             Some(d) => {
                 let now = Instant::now();
                 if now >= d {
-                    let _ = signal::killpg(pid, Signal::SIGKILL);
-                    deadline = None;
-                    match rx.recv() {
-                        Ok(m) => m,
-                        Err(_) => {
-                            server_closed = true;
-                            break Err(std::io::Error::other("runner channel closed"));
-                        }
+                    if exited.is_none() {
+                        let _ = signal::killpg(pid, Signal::SIGKILL);
                     }
-                } else {
-                    match rx.recv_timeout(d - now) {
-                        Ok(m) => m,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            server_closed = true;
-                            break Err(std::io::Error::other("runner channel closed"));
-                        }
+                    deadline = None;
+                    continue;
+                }
+                match rx.recv_timeout(d - now) {
+                    Ok(m) => m,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        server_closed = true;
+                        break Err(std::io::Error::other("runner channel closed"));
                     }
                 }
             }
@@ -603,22 +735,58 @@ fn wait_for_agent(
         };
 
         match msg {
-            RunnerMsg::ChildExited(status) => break status,
+            RunnerMsg::ChildExited(status) => {
+                exited = Some(status);
+                deadline = None;
+            }
             RunnerMsg::Server(ServerMessage::Event(RunnerEvent::Stop { task_id: id }))
                 if id == task_id =>
             {
-                if !stop_requested {
-                    stop_requested = true;
+                if !stop_requested && exited.is_none() {
                     let _ = signal::killpg(pid, Signal::SIGTERM);
                     deadline = Some(Instant::now() + Duration::from_secs(3));
                 }
+                stop_requested = true;
+            }
+            RunnerMsg::Server(ServerMessage::Event(RunnerEvent::Input {
+                task_id: id,
+                input_id,
+                text,
+            })) => {
+                let refusal = if id != task_id {
+                    Some("it is not the task running here")
+                } else if stop_requested || term_signal {
+                    Some("the agent is being stopped")
+                } else if exited.is_some() {
+                    Some("the agent has exited")
+                } else if typing.is_some() {
+                    Some("another reply is still being typed")
+                } else {
+                    None
+                };
+                match refusal {
+                    Some(reason) => refuse_input(writer, &id, input_id, reason),
+                    None => {
+                        typing = Some(input_id);
+                        spawn_typing(tx.clone(), id, input_id, text);
+                    }
+                }
+            }
+            RunnerMsg::Typed(done) => {
+                if typing == Some(done.input_id) {
+                    typing = None;
+                }
+                if done.outcome != InputOutcome::NotTyped {
+                    last_typed = Some(Instant::now());
+                }
+                send_input_result(writer, done);
             }
             RunnerMsg::ServerClosed => {
                 server_closed = true;
             }
             RunnerMsg::TermSignal => {
                 term_signal = true;
-                if deadline.is_none() {
+                if deadline.is_none() && exited.is_none() {
                     let _ = signal::killpg(pid, Signal::SIGTERM);
                     deadline = Some(Instant::now() + Duration::from_secs(3));
                 }
@@ -631,7 +799,13 @@ fn wait_for_agent(
         rx.push_back(msg);
     }
 
-    (exit_status, stop_requested, server_closed, term_signal)
+    AgentWait {
+        exit_status,
+        stop_requested,
+        server_closed,
+        term_signal,
+        last_typed,
+    }
 }
 
 fn oneshot_outcome(exit_status: &std::io::Result<ExitStatus>) -> Outcome {
@@ -647,7 +821,12 @@ enum PromptResult {
     Exit,
 }
 
-fn prompt_outcome(tty: &File, task_id: &str, rx: &mut EventStream) -> anyhow::Result<PromptResult> {
+fn prompt_outcome(
+    tty: &File,
+    task_id: &str,
+    rx: &mut EventStream,
+    writer: &mut UnixStream,
+) -> anyhow::Result<PromptResult> {
     write_escape(
         tty,
         "\nagent exited on its own. [d]one / [r]estart / [f]ailed? ",
@@ -658,14 +837,19 @@ fn prompt_outcome(tty: &File, task_id: &str, rx: &mut EventStream) -> anyhow::Re
     termios::cfmakeraw(&mut raw);
     termios::tcsetattr(tty, SetArg::TCSANOW, &raw)?;
 
-    let result = prompt_loop(tty, task_id, rx);
+    let result = prompt_loop(tty, task_id, rx, writer);
 
     let _ = termios::tcsetattr(tty, SetArg::TCSANOW, &saved);
     write_escape(tty, "\n");
     result
 }
 
-fn prompt_loop(tty: &File, task_id: &str, rx: &mut EventStream) -> anyhow::Result<PromptResult> {
+fn prompt_loop(
+    tty: &File,
+    task_id: &str,
+    rx: &mut EventStream,
+    writer: &mut UnixStream,
+) -> anyhow::Result<PromptResult> {
     let mut deferred: Vec<RunnerMsg> = Vec::new();
 
     let result = loop {
@@ -678,6 +862,11 @@ fn prompt_loop(tty: &File, task_id: &str, rx: &mut EventStream) -> anyhow::Resul
             Ok(RunnerMsg::ServerClosed) | Ok(RunnerMsg::TermSignal) => {
                 break Ok(PromptResult::Exit);
             }
+            Ok(RunnerMsg::Server(ServerMessage::Event(RunnerEvent::Input {
+                task_id: id,
+                input_id,
+                ..
+            }))) => refuse_input(writer, &id, input_id, "the agent has exited"),
             Ok(other) => deferred.push(other),
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => break Ok(PromptResult::Exit),
@@ -734,6 +923,8 @@ mod tests {
             position: 1,
             created_at: "2026-01-01T00:00:00+09:00".to_string(),
             updated_at: "2026-01-01T00:00:00+09:00".to_string(),
+            attention: None,
+            turn: None,
         }
     }
 

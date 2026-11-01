@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use zelloom::client::call;
 use zelloom::core::{CoreOptions, NoopLauncher, run as core_run};
-use zelloom::protocol::{Request, Source, Task, TaskStatus};
+use zelloom::protocol::{
+    AttentionKind, InputOutcome, Request, Source, Task, TaskStatus, TurnState,
+};
 
 const TASK_TEXT: &str =
     "fix \"quotes\" and 'single' $HOME `x` $(echo no)\n二行目 * ; exec \"$@\" \\";
@@ -158,6 +160,13 @@ env = {{ BOTH = "workspace" }}
     }
 
     fn start_runner(&mut self, shell: &Path) {
+        self.start_runner_with_env(
+            shell,
+            &[("ZELLOOM_ZELLIJ", Path::new("/nonexistent").as_os_str())],
+        );
+    }
+
+    fn start_runner_with_env(&mut self, shell: &Path, extra_env: &[(&str, &std::ffi::OsStr)]) {
         let pty = nix::pty::openpty(None, None).unwrap();
         let slave: OwnedFd = pty.slave;
         let mut command = Command::new(env!("CARGO_BIN_EXE_loom"));
@@ -173,7 +182,7 @@ env = {{ BOTH = "workspace" }}
             .env("ENV", self.home.join(".shrc"))
             .env("SHELL", shell)
             .env("TERM", "xterm")
-            .env("ZELLOOM_ZELLIJ", "/nonexistent")
+            .envs(extra_env.iter().copied())
             .env("EDITOR", self.home.join("rcbin/fake-editor"))
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -596,4 +605,268 @@ fn idle_runner_queues_a_task_written_in_the_editor_after_two_empty_lines() {
     harness.loom_done(&agent.env);
     harness.wait_status(&task.id, TaskStatus::Done);
     harness.finish();
+}
+
+fn install_fake_zellij(harness: &Harness, tail: &str) -> (PathBuf, PathBuf) {
+    let calls = harness.out.join("zellij-calls");
+    std::fs::create_dir_all(&calls).unwrap();
+    let fake_zellij = harness.home.join("rcbin/fake-zellij");
+    std::fs::write(
+        &fake_zellij,
+        format!(
+            "#!/bin/sh\nn=$(ls {dir:?} | wc -l)\nprintf '%s\\0' \"$@\" > {dir:?}/call-$n\n{tail}",
+            dir = calls.display().to_string()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &fake_zellij,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    (fake_zellij, calls)
+}
+
+fn start_runner_in_zellij(harness: &mut Harness, fake_zellij: &Path) {
+    harness.start_runner_with_env(
+        &find_program("bash").unwrap(),
+        &[
+            ("ZELLOOM_ZELLIJ", fake_zellij.as_os_str()),
+            ("ZELLIJ_SESSION_NAME", std::ffi::OsStr::new("sess")),
+            ("ZELLIJ_PANE_ID", std::ffi::OsStr::new("42")),
+        ],
+    );
+}
+
+fn read_call(calls: &Path, n: usize) -> Vec<String> {
+    let bytes = std::fs::read(calls.join(format!("call-{n}"))).unwrap();
+    let mut args: Vec<String> = bytes
+        .split(|b| *b == 0)
+        .map(|a| String::from_utf8(a.to_vec()).unwrap())
+        .collect();
+    args.pop();
+    args
+}
+
+fn report_and_end_turn(harness: &Harness, task_id: &str) -> u64 {
+    let reported: Task = serde_json::from_value(
+        call(
+            &harness.socket,
+            &Request::Report {
+                task_id: task_id.to_string(),
+                kind: AttentionKind::Question,
+                message: "which one?".to_string(),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    call(
+        &harness.socket,
+        &Request::Turn {
+            task_id: task_id.to_string(),
+            state: TurnState::Idle,
+        },
+    )
+    .unwrap();
+    reported.attention.unwrap().id
+}
+
+fn send_request(task_id: &str, expect: u64, text: &str) -> Request {
+    Request::Send {
+        task_id: task_id.to_string(),
+        expect,
+        text: text.to_string(),
+    }
+}
+
+#[test]
+fn input_event_types_the_reply_into_the_runner_pane_and_presses_enter() {
+    let mut harness = Harness::new(false);
+    let (fake_zellij, calls) = install_fake_zellij(&harness, "");
+    start_runner_in_zellij(&mut harness, &fake_zellij);
+
+    let task_id = harness.enqueue();
+    let agent = harness.wait_agent(&task_id);
+    let expect = report_and_end_turn(&harness, &task_id);
+    let sent = call(
+        &harness.socket,
+        &send_request(&task_id, expect, "-y the second\r\nthanks\r\n"),
+    );
+    assert!(sent.is_ok(), "{sent:?}");
+    assert!(calls.join("call-1").exists(), "send answered before typing");
+    assert_eq!(
+        read_call(&calls, 0),
+        [
+            "--session",
+            "sess",
+            "action",
+            "write-chars",
+            "--pane-id",
+            "42",
+            "--",
+            "-y the second\nthanks"
+        ]
+    );
+    assert_eq!(
+        read_call(&calls, 1),
+        [
+            "--session",
+            "sess",
+            "action",
+            "write",
+            "--pane-id",
+            "42",
+            "13"
+        ]
+    );
+    assert!(proc_stat(agent.pid).is_some(), "agent keeps running");
+    let task = harness.list().remove(0);
+    assert_eq!((task.attention, task.turn), (None, Some(TurnState::Busy)));
+
+    harness.loom_done(&agent.env);
+    harness.wait_status(&task_id, TaskStatus::Done);
+    assert_eq!(std::fs::read_dir(&calls).unwrap().count(), 2);
+    harness.finish();
+}
+
+#[test]
+fn hanging_zellij_times_out_while_stop_is_still_handled() {
+    let mut harness = Harness::new(false);
+    let (fake_zellij, calls) = install_fake_zellij(&harness, "exec sleep 30\n");
+    start_runner_in_zellij(&mut harness, &fake_zellij);
+
+    let task_id = harness.enqueue();
+    let agent = harness.wait_agent(&task_id);
+    let expect = report_and_end_turn(&harness, &task_id);
+    let socket = harness.socket.clone();
+    let request = send_request(&task_id, expect, "sqlite");
+    let started = Instant::now();
+    let pending = std::thread::spawn(move || call(&socket, &request));
+    wait_until("write-chars to start", Duration::from_secs(10), || {
+        calls.join("call-0").exists()
+    });
+
+    harness.loom_done(&agent.env);
+    wait_until("agent to be stopped", Duration::from_secs(4), || {
+        proc_stat(agent.pid).is_none()
+    });
+    assert!(!pending.is_finished(), "typing should still be pending");
+
+    let error = pending.join().unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("unconfirmed") && error.contains("write-chars"),
+        "{error}"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(4) && waited < Duration::from_secs(12),
+        "{waited:?}"
+    );
+    assert_eq!(std::fs::read_dir(&calls).unwrap().count(), 1);
+    harness.wait_status(&task_id, TaskStatus::Done);
+    wait_until("runner to go idle", Duration::from_secs(10), || {
+        harness.pty_text().matches("waiting for tasks").count() >= 2
+    });
+    harness.finish();
+}
+
+#[test]
+fn leftover_input_after_the_agent_exits_does_not_answer_the_prompt() {
+    let mut harness = Harness::new(false);
+    harness.start_runner(&find_program("bash").unwrap());
+
+    let task_id = harness.enqueue();
+    let agent = harness.wait_agent(&task_id);
+    report_and_end_turn(&harness, &task_id);
+    harness.type_line("done, and some more");
+    std::thread::sleep(Duration::from_millis(200));
+    unsafe {
+        libc::kill(agent.pid, libc::SIGKILL);
+    }
+    wait_until("the outcome prompt", Duration::from_secs(10), || {
+        harness.pty_text().contains("exited on its own")
+    });
+    std::thread::sleep(Duration::from_millis(700));
+    let task = harness.list().remove(0);
+    assert_eq!(task.status, TaskStatus::Running, "{}", harness.pty_text());
+    assert_eq!((task.attention, task.turn), (None, Some(TurnState::Busy)));
+
+    harness.pty_input.as_ref().unwrap().write_all(b"f").unwrap();
+    harness.wait_status(&task_id, TaskStatus::Failed);
+    harness.finish();
+}
+
+#[test]
+fn idle_runner_refuses_input_without_typing() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = PathBuf::from(format!(
+        "/tmp/zl-fake-{}-{}.sock",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let fake_core = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+        assert!(line.contains("runner_attach"), "{line}");
+        writer
+            .write_all(
+                b"{\"ok\":true}\n{\"event\":\"input\",\"task_id\":\"t1\",\"input_id\":9,\"text\":\"hi\"}\n",
+            )
+            .unwrap();
+        line.clear();
+        std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+        serde_json::from_str::<Request>(line.trim_end()).unwrap()
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_loom"));
+    command
+        .arg("--socket")
+        .arg(&socket)
+        .arg("runner")
+        .arg("a")
+        .env("ZELLOOM_ZELLIJ", dir.path().join("no-zellij"))
+        .env("ZELLIJ_SESSION_NAME", "sess")
+        .env("ZELLIJ_PANE_ID", "42")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let runner = command.spawn().unwrap();
+    let result = fake_core.join().unwrap();
+    let output = runner.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&socket);
+    match result {
+        Request::InputResult {
+            task_id,
+            input_id,
+            outcome,
+            error,
+        } => {
+            assert_eq!((task_id.as_str(), input_id), ("t1", 9));
+            assert_eq!(outcome, InputOutcome::NotTyped);
+            assert_eq!(error.as_deref(), Some("no agent is running here"));
+        }
+        other => panic!("expected input_result, got {other:?}"),
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did not type a reply for task t1"),
+        "{stderr}"
+    );
 }

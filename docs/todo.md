@@ -17,6 +17,10 @@
 ## 既知の制限
 
 - タブ起動（`TabLauncher::launch`）は `spawn_blocking` で実行するので tokio のワーカースレッドは塞がないが、`schedule()` はその完了を `scheduling_lock` を保持したまま待つ。`zellij` の応答が遅いと、その間 `schedule()` を呼ぶ操作（`enqueue` など）の応答も遅れる。
+- `report` と `turn` は、ソケットに届くプロセスならどのタスクに対しても送れる（タスクごとのトークンが無い）。同じ uid のプロセスは agent の環境やソケットを読めるので、トークンを足しても防げない。
+- `send` が通るには agent 側の hook（ターンの終わりに `loom turn idle`、始まりに `loom turn busy`、権限ダイアログで `loom report blocked`）が要る。今のところ hook の例があるのは Claude Code だけで、codex のワーカーには別の仕組みが要る。
+- `send` が打ち込みを拒否できるのは hook がターンとダイアログを正しく知らせている間だけ。zelloom はペインの実際の画面を見ていない。
+- 権限ダイアログの hook が報告した `blocked` は、人間がダイアログに答えたあとも次の `report` まで残る。ワーカーが報告せずにターンを終えると、監督役からは `blocked` のまま `idle` に見え、`send` もできない。
 
 ## 未実装の機能・仕上げ
 
@@ -26,4 +30,6 @@
 - TUI の一覧に長いリストのスクロールが無い。`ratatui::widgets::List` を `ListState`/オフセット無しで描画しているため、セクションの高さを超えるタスクは画面から溢れて見えなくなる。
 - TUI から `done` / `cancelled` / `rejected` のタスクを見る手段、`cancelled` のタスクを retry する手段が無い（見出しに `done` / `cancelled` の全期間の件数が出るだけ）。
 - HTTP アダプタ（[http.md](architecture/http.md)）に認証・トークンが無く、`http.listen` が loopback であることでしか守られていない。非 loopback に公開したい場合に備えて何らかのトークン機構が要る。
+- `tests/http_adapter.rs` は空きポートを調べてから core に bind させるので、その間に別のテストが同じポートを取ると `Address already in use` でまれに失敗する。
+- TUI に `attention` の表示が無い。`loom list --json` / `loom show` / `loom watch` でしか見えない。
 - HTTP アダプタにタスクの状態を取得する GET エンドポイントが無い。`POST /tasks` で作成した直後のレスポンスでしか状態がわからない。

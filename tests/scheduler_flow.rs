@@ -9,7 +9,8 @@ use zelloom::cli::{ensure_core, stop_core};
 use zelloom::client::{Client, ClientError, call};
 use zelloom::core::{CoreOptions, NoopLauncher, TabLauncher, run as core_run};
 use zelloom::protocol::{
-    Outcome, Request, ResolvedAgent, Response, RunnerEvent, ServerMessage, Source, Task, TaskStatus,
+    AttentionKind, InputOutcome, Outcome, Request, ResolvedAgent, Response, RunnerEvent,
+    ServerMessage, Source, Task, TaskStatus, TurnState, WatchEvent,
 };
 
 fn write_config(path: &Path) {
@@ -154,16 +155,26 @@ fn expect_stop(client: &mut Client) -> String {
 }
 
 fn enqueue(socket_path: &Path, workspace: &str, text: &str) -> Task {
-    let request = Request::Enqueue {
-        text: text.to_string(),
-        workspace: workspace.to_string(),
-        agent: None,
-        source: Source::cli(),
-        reply_to: None,
-        metadata: serde_json::json!({}),
-    };
-    let data = call(socket_path, &request).unwrap();
-    serde_json::from_value(data).unwrap()
+    enqueue_from(socket_path, workspace, text, "cli")
+}
+
+fn enqueue_from(socket_path: &Path, workspace: &str, text: &str, source: &str) -> Task {
+    let response = request(
+        socket_path,
+        &Request::Enqueue {
+            text: text.to_string(),
+            workspace: workspace.to_string(),
+            agent: None,
+            source: Source {
+                kind: source.to_string(),
+                id: None,
+                sender: None,
+            },
+            reply_to: None,
+            metadata: serde_json::json!({}),
+        },
+    );
+    serde_json::from_value(response.into_result().unwrap().unwrap()).unwrap()
 }
 
 fn get_task(socket_path: &Path, task_id: &str) -> Task {
@@ -381,31 +392,6 @@ impl TabLauncher for FailingLauncher {
     }
 }
 
-fn call_with_timeout(socket_path: &Path, request: &Request) -> Response {
-    let mut client = Client::connect(socket_path).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    client
-        .call(request)
-        .expect("core did not respond in time (deadlock?)")
-}
-
-fn enqueue_with_timeout(socket_path: &Path, workspace: &str, text: &str) -> Task {
-    let response = call_with_timeout(
-        socket_path,
-        &Request::Enqueue {
-            text: text.to_string(),
-            workspace: workspace.to_string(),
-            agent: None,
-            source: Source::cli(),
-            reply_to: None,
-            metadata: serde_json::json!({}),
-        },
-    );
-    serde_json::from_value(response.into_result().unwrap().unwrap()).unwrap()
-}
-
 fn expect_response(client: &mut Client) -> Response {
     match client.read_message().unwrap() {
         ServerMessage::Response(response) => response,
@@ -429,10 +415,10 @@ fn failed_tab_launch_interrupts_the_task_and_core_keeps_responding() {
     let dir = tempfile::tempdir().unwrap();
     let core = start_core_with(dir.path(), Arc::new(FailingLauncher));
 
-    let first = enqueue_with_timeout(&core.socket_path, "a", "no runner for a");
-    let second = enqueue_with_timeout(&core.socket_path, "a", "still no runner for a");
+    let first = enqueue(&core.socket_path, "a", "no runner for a");
+    let second = enqueue(&core.socket_path, "a", "still no runner for a");
 
-    let response = call_with_timeout(&core.socket_path, &Request::List);
+    let response = request(&core.socket_path, &Request::List);
     let tasks: Vec<Task> =
         serde_json::from_value(response.into_result().unwrap().unwrap()).unwrap();
     for id in [&first.id, &second.id] {
@@ -441,11 +427,11 @@ fn failed_tab_launch_interrupts_the_task_and_core_keeps_responding() {
     }
 
     let mut runner_b = attach_runner(&core.socket_path, "b");
-    let task_b = enqueue_with_timeout(&core.socket_path, "b", "b has a runner");
+    let task_b = enqueue(&core.socket_path, "b", "b has a runner");
     let (started, _) = expect_start(&mut runner_b);
     assert_eq!(started.id, task_b.id);
 
-    call_with_timeout(&core.socket_path, &Request::Shutdown { force: true });
+    request(&core.socket_path, &Request::Shutdown { force: true });
     core.handle.join().unwrap();
 }
 
@@ -895,5 +881,918 @@ fn runner_attach_is_only_accepted_as_the_first_message() {
     assert_eq!(started_b.id, task_b.id);
 
     call(&core.socket_path, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+fn request(socket_path: &Path, request: &Request) -> Response {
+    let mut client = Client::connect(socket_path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .call(request)
+        .expect("core did not respond in time (deadlock?)")
+}
+
+fn report(socket_path: &Path, task_id: &str, kind: AttentionKind, message: &str) -> Response {
+    request(
+        socket_path,
+        &Request::Report {
+            task_id: task_id.to_string(),
+            kind,
+            message: message.to_string(),
+        },
+    )
+}
+
+fn send_reply(socket_path: &Path, task_id: &str, expect: u64, text: &str) -> Response {
+    request(
+        socket_path,
+        &Request::Send {
+            task_id: task_id.to_string(),
+            expect,
+            text: text.to_string(),
+        },
+    )
+}
+
+fn send_in_background(
+    socket_path: &Path,
+    task_id: &str,
+    expect: u64,
+    text: &str,
+) -> std::thread::JoinHandle<Response> {
+    let socket_path = socket_path.to_path_buf();
+    let task_id = task_id.to_string();
+    let text = text.to_string();
+    std::thread::spawn(move || send_reply(&socket_path, &task_id, expect, &text))
+}
+
+fn set_turn(socket_path: &Path, task_id: &str, state: TurnState) -> Response {
+    request(
+        socket_path,
+        &Request::Turn {
+            task_id: task_id.to_string(),
+            state,
+        },
+    )
+}
+
+fn report_id(socket_path: &Path, task_id: &str, kind: AttentionKind, message: &str) -> u64 {
+    let response = report(socket_path, task_id, kind, message);
+    assert!(response.ok, "{response:?}");
+    let task: Task = serde_json::from_value(response.data.unwrap()).unwrap();
+    assert_eq!(task.turn, Some(TurnState::Busy));
+    task.attention.unwrap().id
+}
+
+fn waiting_report(socket_path: &Path, task_id: &str, kind: AttentionKind) -> u64 {
+    let id = report_id(socket_path, task_id, kind, "waiting");
+    assert!(set_turn(socket_path, task_id, TurnState::Idle).ok);
+    id
+}
+
+fn expect_input(client: &mut Client) -> (String, u64, String) {
+    match client.read_message().unwrap() {
+        ServerMessage::Event(RunnerEvent::Input {
+            task_id,
+            input_id,
+            text,
+        }) => (task_id, input_id, text),
+        other => panic!("expected an input event, got {other:?}"),
+    }
+}
+
+fn answer_input(
+    client: &mut Client,
+    task_id: &str,
+    input_id: u64,
+    outcome: InputOutcome,
+    error: Option<&str>,
+) -> Response {
+    client
+        .write_request(&Request::InputResult {
+            task_id: task_id.to_string(),
+            input_id,
+            outcome,
+            error: error.map(str::to_string),
+        })
+        .unwrap();
+    expect_response(client)
+}
+
+fn expect_error_containing(response: Response, parts: &[&str]) {
+    assert!(!response.ok, "expected an error, got {response:?}");
+    let error = response.error.unwrap();
+    for part in parts {
+        assert!(error.contains(part), "{error:?} does not contain {part:?}");
+    }
+}
+
+fn expect_error(response: Response, expected: &str) {
+    assert!(!response.ok, "expected an error, got {response:?}");
+    assert_eq!(response.error.as_deref(), Some(expected));
+}
+
+fn open_watch(socket_path: &Path) -> Client {
+    let mut client = Client::connect(socket_path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client.write_request(&Request::Watch).unwrap();
+    client
+}
+
+fn next_event(client: &mut Client) -> WatchEvent {
+    let line = client
+        .read_raw_line()
+        .unwrap()
+        .expect("watch stream closed unexpectedly");
+    serde_json::from_str(line.trim_end()).unwrap()
+}
+
+fn expect_task_event(client: &mut Client) -> Task {
+    match next_event(client) {
+        WatchEvent::Task { task } => task,
+        other => panic!("expected a task event, got {other:?}"),
+    }
+}
+
+#[test]
+fn report_sets_attention_only_on_running_tasks_and_finishing_clears_it() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+
+    let first = enqueue(&core.socket_path, "a", "first");
+    let second = enqueue(&core.socket_path, "a", "second");
+    let (started, _) = expect_start(&mut runner);
+    assert_eq!(started.id, first.id);
+    assert!(get_task(&core.socket_path, &first.id).attention.is_none());
+
+    expect_error(
+        report(&core.socket_path, &second.id, AttentionKind::Question, "q"),
+        &format!("task '{}' is 'queued', not 'running'", second.id),
+    );
+    expect_error(
+        report(&core.socket_path, "missing", AttentionKind::Question, "q"),
+        "task 'missing' not found",
+    );
+
+    let reported = report(
+        &core.socket_path,
+        &first.id,
+        AttentionKind::Question,
+        "which db?\n",
+    );
+    assert!(reported.ok, "{reported:?}");
+    let attention = get_task(&core.socket_path, &first.id).attention.unwrap();
+    assert_eq!(attention.kind, AttentionKind::Question);
+    assert_eq!(attention.message, "which db?");
+    assert!(!attention.at.is_empty());
+
+    assert!(report(&core.socket_path, &first.id, AttentionKind::Ready, "done?").ok);
+    let attention = get_task(&core.socket_path, &first.id).attention.unwrap();
+    assert_eq!(attention.kind, AttentionKind::Ready);
+    assert_eq!(attention.message, "done?");
+
+    call(
+        &core.socket_path,
+        &Request::Complete {
+            task_id: first.id.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(expect_stop(&mut runner), first.id);
+    let done = get_task(&core.socket_path, &first.id);
+    assert_eq!(done.status, TaskStatus::Done);
+    assert!(done.attention.is_none());
+    expect_error(
+        report(&core.socket_path, &first.id, AttentionKind::Gate, "g"),
+        &format!("task '{}' is 'done', not 'running'", first.id),
+    );
+
+    let (started, _) = expect_start(&mut runner);
+    assert_eq!(started.id, second.id);
+    assert!(
+        report(
+            &core.socket_path,
+            &second.id,
+            AttentionKind::Blocked,
+            "stuck"
+        )
+        .ok
+    );
+    drop(runner);
+    let interrupted = wait_for_status(&core.socket_path, &second.id, TaskStatus::Interrupted);
+    assert!(interrupted.attention.is_none());
+
+    call(&core.socket_path, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn watch_sends_snapshot_then_synced_then_every_change() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+
+    let held = enqueue_from(&core.socket_path, "a", "held in inbox", "inbox");
+    let finished = enqueue(&core.socket_path, "a", "finished before watching");
+    expect_start(&mut runner);
+    call(
+        &core.socket_path,
+        &Request::Complete {
+            task_id: finished.id.clone(),
+        },
+    )
+    .unwrap();
+    expect_stop(&mut runner);
+
+    let mut watch = open_watch(&core.socket_path);
+    let snapshot = expect_task_event(&mut watch);
+    assert_eq!(snapshot.id, held.id);
+    assert_eq!(snapshot.status, TaskStatus::Received);
+    assert!(matches!(next_event(&mut watch), WatchEvent::Synced));
+
+    let task = enqueue(&core.socket_path, "a", "watched");
+    let created = expect_task_event(&mut watch);
+    assert_eq!(
+        (created.id.as_str(), created.status),
+        (task.id.as_str(), TaskStatus::Queued)
+    );
+    let started = expect_task_event(&mut watch);
+    assert_eq!(
+        (started.id.as_str(), started.status),
+        (task.id.as_str(), TaskStatus::Running)
+    );
+    expect_start(&mut runner);
+
+    assert!(report(&core.socket_path, &task.id, AttentionKind::Gate, "push?").ok);
+    let reported = expect_task_event(&mut watch);
+    assert_eq!(reported.attention.unwrap().message, "push?");
+
+    call(
+        &core.socket_path,
+        &Request::Edit {
+            task_id: held.id.clone(),
+            text: "edited".to_string(),
+        },
+    )
+    .unwrap();
+    let edited = expect_task_event(&mut watch);
+    assert_eq!(
+        (edited.id.as_str(), edited.text.as_str()),
+        (held.id.as_str(), "edited")
+    );
+
+    call(
+        &core.socket_path,
+        &Request::Complete {
+            task_id: task.id.clone(),
+        },
+    )
+    .unwrap();
+    expect_stop(&mut runner);
+    let completed = expect_task_event(&mut watch);
+    assert_eq!(completed.status, TaskStatus::Done);
+    assert!(completed.attention.is_none());
+
+    call(
+        &core.socket_path,
+        &Request::Delete {
+            task_id: task.id.clone(),
+        },
+    )
+    .unwrap();
+    match next_event(&mut watch) {
+        WatchEvent::TaskDeleted { task_id } => assert_eq!(task_id, task.id),
+        other => panic!("expected task_deleted, got {other:?}"),
+    }
+
+    let mut late = Client::connect(&core.socket_path).unwrap();
+    late.call(&Request::Status).unwrap();
+    expect_error(
+        late.call(&Request::Watch).unwrap(),
+        "watch must be the first message on a connection",
+    );
+
+    call(&core.socket_path, &Request::Shutdown { force: true }).unwrap();
+    assert!(watch.read_raw_line().unwrap().is_none());
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn watch_reports_lag_and_closes_the_stream() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let held = enqueue_from(&core.socket_path, "a", "held", "inbox");
+
+    let mut watch = open_watch(&core.socket_path);
+    let mut editor = Client::connect(&core.socket_path).unwrap();
+    let text = "x".repeat(4096);
+    for _ in 0..2000 {
+        let response = editor
+            .call(&Request::Edit {
+                task_id: held.id.clone(),
+                text: text.clone(),
+            })
+            .unwrap();
+        assert!(response.ok);
+    }
+
+    let mut last = None;
+    while let Some(line) = watch.read_raw_line().unwrap() {
+        last = Some(serde_json::from_str::<WatchEvent>(line.trim_end()).unwrap());
+    }
+    match last {
+        Some(WatchEvent::Error { error }) => assert!(error.contains("fell behind"), "{error}"),
+        other => panic!("expected the stream to end with an error, got {other:?}"),
+    }
+
+    call(&core.socket_path, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn turn_follows_the_agent_and_reports_get_increasing_ids() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+
+    let task = enqueue(&core.socket_path, "a", "worker");
+    let queued = enqueue(&core.socket_path, "a", "waits");
+    expect_start(&mut runner);
+    assert_eq!(
+        get_task(&core.socket_path, &task.id).turn,
+        Some(TurnState::Busy)
+    );
+    assert_eq!(get_task(&core.socket_path, &queued.id).turn, None);
+    expect_error(
+        set_turn(&core.socket_path, &queued.id, TurnState::Idle),
+        &format!("task '{}' is 'queued', not 'running'", queued.id),
+    );
+    expect_error(
+        set_turn(&core.socket_path, "missing", TurnState::Idle),
+        "task 'missing' not found",
+    );
+
+    let mut watch = open_watch(&core.socket_path);
+    assert_eq!(expect_task_event(&mut watch).id, task.id);
+    expect_task_event(&mut watch);
+    assert!(matches!(next_event(&mut watch), WatchEvent::Synced));
+
+    assert!(set_turn(&core.socket_path, &task.id, TurnState::Idle).ok);
+    assert_eq!(expect_task_event(&mut watch).turn, Some(TurnState::Idle));
+    assert!(set_turn(&core.socket_path, &task.id, TurnState::Idle).ok);
+    assert!(set_turn(&core.socket_path, &task.id, TurnState::Busy).ok);
+    assert_eq!(expect_task_event(&mut watch).turn, Some(TurnState::Busy));
+    assert!(set_turn(&core.socket_path, &task.id, TurnState::Busy).ok);
+
+    let first = report_id(&core.socket_path, &task.id, AttentionKind::Question, "a");
+    let reported = expect_task_event(&mut watch);
+    assert_eq!(reported.attention.unwrap().id, first);
+    assert!(set_turn(&core.socket_path, &task.id, TurnState::Idle).ok);
+    let second = report_id(&core.socket_path, &task.id, AttentionKind::Gate, "b");
+    let third = report_id(&core.socket_path, &task.id, AttentionKind::Blocked, "c");
+    assert!(first < second && second < third, "{first} {second} {third}");
+    assert_eq!(
+        get_task(&core.socket_path, &task.id).turn,
+        Some(TurnState::Busy)
+    );
+
+    call(
+        &core.socket_path,
+        &Request::Complete {
+            task_id: task.id.clone(),
+        },
+    )
+    .unwrap();
+    expect_stop(&mut runner);
+    let done = get_task(&core.socket_path, &task.id);
+    assert_eq!((done.turn, done.attention), (None, None));
+    let (next, _) = expect_start(&mut runner);
+    assert_eq!(next.id, queued.id);
+    assert_eq!(next.turn, Some(TurnState::Busy));
+
+    call(&core.socket_path, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn send_is_refused_unless_the_worker_ended_its_turn_after_the_expected_report() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+
+    let task = enqueue(&core.socket_path, "a", "needs answers");
+    let queued = enqueue(&core.socket_path, "a", "waits its turn");
+    expect_start(&mut runner);
+    let socket = core.socket_path.as_path();
+
+    expect_error(
+        send_reply(socket, &task.id, 1, "hello"),
+        &format!(
+            "task '{}' is not waiting for a reply (no attention)",
+            task.id
+        ),
+    );
+    expect_error(
+        send_reply(socket, &queued.id, 1, "hello"),
+        &format!("task '{}' is 'queued', not 'running'", queued.id),
+    );
+    expect_error(
+        send_reply(socket, "missing", 1, "hello"),
+        "task 'missing' not found",
+    );
+
+    let asked = report_id(socket, &task.id, AttentionKind::Question, "which db?");
+    expect_error(
+        send_reply(socket, &task.id, asked, "sqlite"),
+        &format!(
+            "task '{}' is still in its turn (turn: busy); wait until its agent ends the turn",
+            task.id
+        ),
+    );
+
+    assert!(set_turn(socket, &task.id, TurnState::Idle).ok);
+    let asked_again = report_id(
+        socket,
+        &task.id,
+        AttentionKind::Question,
+        "which db, again?",
+    );
+    expect_error_containing(
+        send_reply(socket, &task.id, asked_again, "sqlite"),
+        &["turn: busy"],
+    );
+
+    assert!(set_turn(socket, &task.id, TurnState::Idle).ok);
+    expect_error(
+        send_reply(socket, &task.id, asked, "sqlite"),
+        &format!(
+            "the reply is for report {asked}, but the current report of task '{}' is {asked_again}; read it before replying",
+            task.id
+        ),
+    );
+
+    for (text, expected) in [
+        (" \r\n", "reply text is empty"),
+        ("yes\x1b[Z", "U+001B"),
+        ("yes\tno", "U+0009"),
+        ("\x03", "U+0003"),
+        ("yes\u{9b}", "U+009B"),
+        ("!rm -rf target", "shell command"),
+        ("  /permissions", "slash command"),
+    ] {
+        expect_error_containing(send_reply(socket, &task.id, asked_again, text), &[expected]);
+    }
+    expect_error_containing(
+        send_reply(socket, &task.id, asked_again, &"y".repeat(16 * 1024 + 1)),
+        &["limit is 16384"],
+    );
+    let task_now = get_task(socket, &task.id);
+    assert_eq!(task_now.attention.unwrap().id, asked_again);
+    assert_eq!(task_now.turn, Some(TurnState::Idle));
+
+    let blocked = waiting_report(socket, &task.id, AttentionKind::Blocked);
+    expect_error(
+        send_reply(socket, &task.id, blocked, "yes"),
+        &format!(
+            "task '{}' is not waiting for a reply (attention: blocked)",
+            task.id
+        ),
+    );
+
+    expect_error_containing(
+        report(socket, &task.id, AttentionKind::Question, "a\0b"),
+        &["NUL"],
+    );
+    expect_error_containing(
+        report(
+            socket,
+            &task.id,
+            AttentionKind::Question,
+            &"m".repeat(16 * 1024 + 1),
+        ),
+        &["limit is 16384"],
+    );
+    assert_eq!(get_task(socket, &task.id).attention.unwrap().id, blocked);
+
+    let other = enqueue(socket, "b", "no runner for b");
+    wait_for_status(socket, &other.id, TaskStatus::Running);
+    let other_report = waiting_report(socket, &other.id, AttentionKind::Question);
+    expect_error(
+        send_reply(socket, &other.id, other_report, "hello"),
+        "no runner is attached for workspace 'b'",
+    );
+
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn send_answers_after_the_runner_typed_the_reply() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+    let task = enqueue(&core.socket_path, "a", "needs answers");
+    expect_start(&mut runner);
+    let socket = core.socket_path.as_path();
+
+    for (kind, text, expected) in [
+        (AttentionKind::Question, "use sqlite\r\n", "use sqlite"),
+        (
+            AttentionKind::Gate,
+            "go ahead\rpush it\n\n",
+            "go ahead\npush it",
+        ),
+        (
+            AttentionKind::Ready,
+            "-y please add tests",
+            "-y please add tests",
+        ),
+    ] {
+        let expect = waiting_report(socket, &task.id, kind);
+        let pending = send_in_background(socket, &task.id, expect, text);
+        let (task_id, input_id, typed) = expect_input(&mut runner);
+        assert_eq!(
+            (task_id.as_str(), typed.as_str()),
+            (task.id.as_str(), expected)
+        );
+        assert!(input_id > expect);
+
+        let in_flight = get_task(socket, &task.id);
+        assert_eq!(
+            (in_flight.attention, in_flight.turn),
+            (None, Some(TurnState::Busy))
+        );
+        expect_error(
+            send_reply(socket, &task.id, expect, "again"),
+            &format!("a reply to task '{}' is still being delivered", task.id),
+        );
+        assert!(!pending.is_finished());
+
+        expect_error_containing(
+            answer_input(
+                &mut runner,
+                &task.id,
+                input_id + 1000,
+                InputOutcome::Typed,
+                None,
+            ),
+            &["no reply"],
+        );
+        assert!(answer_input(&mut runner, &task.id, input_id, InputOutcome::Typed, None).ok);
+        let sent = pending.join().unwrap();
+        assert!(sent.ok, "{sent:?}");
+        let sent: Task = serde_json::from_value(sent.data.unwrap()).unwrap();
+        assert_eq!((sent.attention, sent.turn), (None, Some(TurnState::Busy)));
+        expect_error(
+            send_reply(socket, &task.id, expect, text),
+            &format!(
+                "task '{}' is not waiting for a reply (no attention)",
+                task.id
+            ),
+        );
+    }
+
+    let mut client = Client::connect(socket).unwrap();
+    expect_error(
+        client
+            .call(&Request::InputResult {
+                task_id: task.id.clone(),
+                input_id: 1,
+                outcome: InputOutcome::Typed,
+                error: None,
+            })
+            .unwrap(),
+        "input_result is only accepted on a runner connection",
+    );
+
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn not_typed_reply_reopens_the_report_unless_a_newer_one_replaced_it() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+    let task = enqueue(&core.socket_path, "a", "needs answers");
+    expect_start(&mut runner);
+    let socket = core.socket_path.as_path();
+
+    let expect = waiting_report(socket, &task.id, AttentionKind::Question);
+    let pending = send_in_background(socket, &task.id, expect, "sqlite");
+    let (_, input_id, _) = expect_input(&mut runner);
+    assert!(
+        answer_input(
+            &mut runner,
+            &task.id,
+            input_id,
+            InputOutcome::NotTyped,
+            Some("no pane")
+        )
+        .ok
+    );
+    expect_error(
+        pending.join().unwrap(),
+        &format!(
+            "the reply was not typed into task '{}': no pane; its report is open again",
+            task.id
+        ),
+    );
+    let reopened = get_task(socket, &task.id);
+    assert_eq!(reopened.attention.unwrap().id, expect);
+    assert_eq!(reopened.turn, Some(TurnState::Idle));
+
+    let pending = send_in_background(socket, &task.id, expect, "sqlite");
+    let (_, input_id, _) = expect_input(&mut runner);
+    let newer = report_id(socket, &task.id, AttentionKind::Gate, "push?");
+    assert!(
+        answer_input(
+            &mut runner,
+            &task.id,
+            input_id,
+            InputOutcome::NotTyped,
+            None
+        )
+        .ok
+    );
+    expect_error_containing(pending.join().unwrap(), &["not typed", "replaced"]);
+    let replaced = get_task(socket, &task.id);
+    assert_eq!(replaced.attention.unwrap().id, newer);
+    assert_eq!(replaced.turn, Some(TurnState::Busy));
+
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn unconfirmed_delivery_leaves_the_report_closed() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var("ZELLOOM_INPUT_TIMEOUT_MS", "300");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    unsafe {
+        std::env::remove_var("ZELLOOM_INPUT_TIMEOUT_MS");
+    }
+    let mut runner = attach_runner(&core.socket_path, "a");
+    let task = enqueue(&core.socket_path, "a", "needs answers");
+    expect_start(&mut runner);
+    let socket = core.socket_path.as_path();
+    let assert_closed = || {
+        let task = get_task(socket, &task.id);
+        assert_eq!((task.attention, task.turn), (None, Some(TurnState::Busy)));
+    };
+
+    let expect = waiting_report(socket, &task.id, AttentionKind::Question);
+    let pending = send_in_background(socket, &task.id, expect, "sqlite");
+    let (_, input_id, _) = expect_input(&mut runner);
+    assert!(
+        answer_input(
+            &mut runner,
+            &task.id,
+            input_id,
+            InputOutcome::Partial,
+            Some("Enter was not sent")
+        )
+        .ok
+    );
+    expect_error_containing(
+        pending.join().unwrap(),
+        &[
+            "unconfirmed",
+            "only part",
+            "Enter was not sent",
+            "check its tab",
+        ],
+    );
+    assert_closed();
+
+    let expect = waiting_report(socket, &task.id, AttentionKind::Question);
+    let pending = send_in_background(socket, &task.id, expect, "sqlite");
+    let (_, input_id, _) = expect_input(&mut runner);
+    expect_error_containing(
+        pending.join().unwrap(),
+        &["unconfirmed", "did not answer within 300 ms"],
+    );
+    assert_closed();
+    expect_error_containing(
+        answer_input(&mut runner, &task.id, input_id, InputOutcome::Typed, None),
+        &["no reply"],
+    );
+
+    let expect = waiting_report(socket, &task.id, AttentionKind::Question);
+    let pending = send_in_background(socket, &task.id, expect, "sqlite");
+    expect_input(&mut runner);
+    drop(runner);
+    expect_error_containing(
+        pending.join().unwrap(),
+        &["unconfirmed", "the runner disconnected"],
+    );
+    let interrupted = wait_for_status(socket, &task.id, TaskStatus::Interrupted);
+    assert_eq!((interrupted.attention, interrupted.turn), (None, None));
+
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn agent_gone_closes_the_report_and_restart_starts_a_busy_turn() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let mut runner = attach_runner(&core.socket_path, "a");
+    let task = enqueue(&core.socket_path, "a", "needs answers");
+    expect_start(&mut runner);
+    let socket = core.socket_path.as_path();
+
+    let expect = waiting_report(socket, &task.id, AttentionKind::Question);
+    expect_error(
+        request(
+            socket,
+            &Request::AgentGone {
+                task_id: task.id.clone(),
+            },
+        ),
+        "agent_gone is only accepted on a runner connection",
+    );
+    runner
+        .write_request(&Request::AgentGone {
+            task_id: "missing".to_string(),
+        })
+        .unwrap();
+    assert!(!expect_response(&mut runner).ok);
+    runner
+        .write_request(&Request::AgentGone {
+            task_id: task.id.clone(),
+        })
+        .unwrap();
+    let gone: Task = serde_json::from_value(expect_response(&mut runner).data.unwrap()).unwrap();
+    assert_eq!((gone.attention, gone.turn), (None, Some(TurnState::Busy)));
+    expect_error(
+        send_reply(socket, &task.id, expect, "sqlite"),
+        &format!(
+            "task '{}' is not waiting for a reply (no attention)",
+            task.id
+        ),
+    );
+
+    waiting_report(socket, &task.id, AttentionKind::Question);
+    runner
+        .write_request(&Request::AgentExited {
+            task_id: task.id.clone(),
+            outcome: Outcome::Restart,
+        })
+        .unwrap();
+    let (restarted, _) = expect_start(&mut runner);
+    assert_eq!(restarted.id, task.id);
+    assert_eq!(
+        (restarted.attention, restarted.turn),
+        (None, Some(TurnState::Busy))
+    );
+    assert!(expect_response(&mut runner).ok);
+
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+const REQUEST_LINE_LIMIT: usize = 1024 * 1024;
+
+fn padded_list_line(total_bytes: usize) -> Vec<u8> {
+    let mut line = br#"{"op":"list"}"#.to_vec();
+    line.resize(total_bytes - 1, b' ');
+    line.push(b'\n');
+    line
+}
+
+fn send_raw_line(socket_path: &Path, line: &[u8]) -> Response {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let _ = stream.write_all(line);
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    serde_json::from_str(reply.trim_end()).unwrap()
+}
+
+#[test]
+fn request_lines_are_limited_to_one_mebibyte_on_every_connection_type() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let socket = core.socket_path.as_path();
+
+    assert!(send_raw_line(socket, &padded_list_line(REQUEST_LINE_LIMIT)).ok);
+    expect_error_containing(
+        send_raw_line(socket, &padded_list_line(REQUEST_LINE_LIMIT + 1)),
+        &["exceeds"],
+    );
+
+    let big_text = "x".repeat(900 * 1024);
+    let task = enqueue_from(socket, "a", &big_text, "inbox");
+    assert_eq!(get_task(socket, &task.id).text.len(), big_text.len());
+
+    let oversized = Request::Enqueue {
+        text: "y".repeat(REQUEST_LINE_LIMIT + 1),
+        workspace: "a".to_string(),
+        agent: None,
+        source: Source::cli(),
+        reply_to: None,
+        metadata: serde_json::json!({}),
+    };
+    let mut client = Client::connect(socket).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(client.call(&Request::List).unwrap().ok);
+    expect_error_containing(client.call(&oversized).unwrap(), &["exceeds"]);
+    expect_connection_closed(&mut client);
+
+    let mut runner = attach_runner(socket, "a");
+    runner
+        .write_request(&Request::AgentExited {
+            task_id: "x".to_string(),
+            outcome: Outcome::Done,
+        })
+        .unwrap();
+    expect_response(&mut runner);
+    expect_error_containing(runner.call(&oversized).unwrap(), &["exceeds"]);
+    expect_connection_closed(&mut runner);
+
+    assert_eq!(get_task(socket, &task.id).status, TaskStatus::Received);
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn get_returns_one_task_or_not_found() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    let socket = core.socket_path.as_path();
+
+    let task = enqueue_from(socket, "a", "find me", "inbox");
+    enqueue_from(socket, "b", "another", "inbox");
+    let response = request(
+        socket,
+        &Request::Get {
+            task_id: task.id.clone(),
+        },
+    );
+    let found: Task = serde_json::from_value(response.data.unwrap()).unwrap();
+    assert_eq!((found.id, found.text), (task.id, "find me".to_string()));
+    expect_error(
+        request(
+            socket,
+            &Request::Get {
+                task_id: "nope".to_string(),
+            },
+        ),
+        "task 'nope' not found",
+    );
+
+    call(socket, &Request::Shutdown { force: true }).unwrap();
+    core.handle.join().unwrap();
+}
+
+#[test]
+fn watcher_that_never_reads_is_disconnected_after_the_write_timeout() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var("ZELLOOM_WATCH_WRITE_TIMEOUT_MS", "300");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let core = start_core(dir.path());
+    unsafe {
+        std::env::remove_var("ZELLOOM_WATCH_WRITE_TIMEOUT_MS");
+    }
+    let socket = core.socket_path.as_path();
+
+    enqueue_from(socket, "a", &"x".repeat(900 * 1024), "inbox");
+    let mut watch = open_watch(socket);
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut received = 0;
+    while let Some(line) = watch.read_raw_line().expect("the stream was not closed") {
+        received += line.len();
+    }
+    assert!(received < 900 * 1024, "{received}");
+
+    assert!(request(socket, &Request::List).ok);
+    call(socket, &Request::Shutdown { force: true }).unwrap();
     core.handle.join().unwrap();
 }

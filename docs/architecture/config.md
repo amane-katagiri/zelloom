@@ -13,9 +13,11 @@
 | ソケット | `$XDG_RUNTIME_DIR/zelloom/default.sock`（無ければ `/tmp/zelloom-<uid>/default.sock`） | 優先順: `--socket`（グローバルCLIフラグ） > `ZELLOOM_SOCKET` > 既定 | `paths::socket_path` |
 | `zellij` バイナリ | `zellij`（`PATH` から解決） | `ZELLOOM_ZELLIJ` | `zellij::zellij_bin` |
 | attach タイムアウト | 20秒 | `ZELLOOM_ATTACH_TIMEOUT_MS`（ミリ秒） | `core::attach_timeout_from_env` |
+| `send` が runner の結果を待つ時間 | 15秒 | `ZELLOOM_INPUT_TIMEOUT_MS`（ミリ秒） | `core::input_timeout_from_env` |
+| watch 接続への 1 回の書き込みの時間制限 | 10秒 | `ZELLOOM_WATCH_WRITE_TIMEOUT_MS`（ミリ秒） | `core::watch_write_timeout_from_env` |
 
 - `--socket` はプロセス内の `OnceLock`（`paths::set_socket_override`）に一度だけ保存され、以後そのプロセス内の `socket_path()` 呼び出しすべてに優先する。CLI 起動直後、サブコマンドを実行する前に設定される。
-- attach タイムアウトは `loom core` 起動時に一度だけ読まれる。実行中に環境変数を変えても反映されない。
+- attach タイムアウト・`send` の待ち時間・watch の書き込みの時間制限は `loom core` 起動時に一度だけ読まれる。実行中に環境変数を変えても反映されない。
 - 設定ファイルが存在しない場合はエラーにせず、空の `Config`（すべて既定値）として扱う。ただし CLI では、設定ファイルが無いことが原因で失敗する操作（`loom add` の workspace 解決、`loom workspace add --agent`）は `loom init` を促すエラーにする。
 - core は接続ごとの操作やスケジューリング判定のたびに設定ファイルを読み直す。`loom workspace add` などで設定を変えると、動いている core の次の操作から反映される。
 
@@ -60,8 +62,9 @@ allowed_origins = ["http://localhost:5173"]
 | `scheduler.max_parallel` | 整数 | 4 | 特に検証なし |
 | `agents.<name>.command` | 文字列配列（argv） | 必須 | 空配列、または先頭（プログラム名）が空文字列なら設定エラー |
 | `agents.<name>.instruction_args` | 文字列配列 | 無し | instruction を渡す引数。各要素の `{instruction}` を instruction に置き換える。どの要素にも `{instruction}` が無ければ設定エラー。無ければ instruction はタスク本文に連結される |
+| `agents.<name>.instruction` | 文字列 | 無し | 組み込みの instruction 本文を丸ごと置き換える。本文中の `{loom_exe}` は loom 実行ファイルのパスに置き換える（組み込みの本文と同じ）。`oneshot = true` と同時に指定すると設定エラー（`agent '<name>' is oneshot and cannot have instruction`）。`instruction_args` とは独立で、置き換えた本文が `{instruction}` の中身になる |
 | `agents.<name>.shell` | 真偽値 | true | true ならユーザーの対話シェル経由で起動する（[下記](#シェル経由の起動)） |
-| `agents.<name>.oneshot` | 真偽値 | false | true なら instruction を渡さず、agent の終了コードでタスクの結果を決める（[runner.md](runner.md#終了後の分岐)）。`instruction_args` と同時に指定すると設定エラー |
+| `agents.<name>.oneshot` | 真偽値 | false | true なら instruction を渡さず、agent の終了コードでタスクの結果を決める（[runner.md](runner.md#終了後の分岐)）。`instruction_args` または `instruction` と同時に指定すると設定エラー |
 | `agents.<name>.env` | 文字列→文字列のテーブル | 空 | agent に渡す環境変数。キーは空文字列・`=` や NUL を含むもの・`ZELLOOM_` で始まるものが設定エラー、値は NUL を含むと設定エラー（`config::validate_env`） |
 | `workspaces.<id>` | テーブル | — | `<id>`（workspace ID）は空文字列・空白や制御文字や `:` を含むものが設定エラー（`config::validate_workspace_id`） |
 | `workspaces.<id>.path` | パス | 必須 | 存在確認はしない |
@@ -96,6 +99,8 @@ When the user explicitly confirms that the current task is finished, run:
     /path/to/loom done
 ```
 
+`agents.<name>.instruction` があればこの本文の代わりにそれを使う（`{loom_exe}` のみ置換）。
+
 argv の組み立て（`build_argv`）:
 
 - `oneshot` の agent: `command + [task.text]`。instruction は渡さない。例: `command = ["claude", "-p"]` なら `["claude", "-p", task.text]`
@@ -111,7 +116,16 @@ core が `ResolvedAgent.env` を組み立て（`scheduler::build_env`）、runne
 1. runner が継承した環境（Zellij サーバの環境。手で開いたペインと同じ）
 2. `agents.<name>.env`
 3. `workspaces.<id>.env`
-4. `ZELLOOM_TASK_ID` / `ZELLOOM_WORKSPACE` / `ZELLOOM_SOCKET`（常に zelloom の値。設定で `ZELLOOM_` で始まるキーは書けない）
+4. `ZELLOOM_TASK_ID` / `ZELLOOM_WORKSPACE` / `ZELLOOM_SOCKET` / `ZELLOOM_LOOM_EXE`（常に zelloom の値。設定で `ZELLOOM_` で始まるキーは書けない）
+
+| 変数 | 値 |
+|---|---|
+| `ZELLOOM_TASK_ID` | タスクの ID |
+| `ZELLOOM_WORKSPACE` | workspace の ID |
+| `ZELLOOM_SOCKET` | core のソケットのパス |
+| `ZELLOOM_LOOM_EXE` | core 自身の loom 実行ファイルの絶対パス（instruction の `{loom_exe}` と同じ値）。agent の hook が使う |
+
+agent の中から呼ぶ `loom done` / `loom report` / `loom turn` は、タスク ID を省略すると `ZELLOOM_TASK_ID` を使い、`ZELLOOM_SOCKET` で同じ core につながる。
 
 値は文字どおりの文字列で、`$HOME` や `~` などは展開しない。
 

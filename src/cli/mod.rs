@@ -1,4 +1,5 @@
-use std::io::Read;
+mod tasks;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::core::CoreOptions;
 use crate::launcher::ZellijLauncher;
-use crate::protocol::{Request, Source, Task};
+use crate::protocol::{AttentionKind, Request, Task, TurnState};
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +49,9 @@ pub enum Command {
         /// Agent to run this task with (overrides the workspace and default agent)
         #[arg(long = "agent")]
         agent: Option<String>,
+        /// Source type recorded on the task (e.g. for `[sources.<type>] auto_queue`)
+        #[arg(long = "source", value_name = "TYPE", default_value = "cli")]
+        source: String,
         /// Task text (read from stdin if omitted)
         text: Option<String>,
     },
@@ -57,7 +61,54 @@ pub enum Command {
         task_id: Option<String>,
     },
     /// List all tasks
-    List,
+    List {
+        /// Print the tasks as a JSON array on one line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one task in full
+    Show {
+        /// Task id
+        task_id: String,
+        /// Print the task as JSON on one line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report what the running task needs (shown in `loom list --json`, `loom show` and `loom watch`)
+    Report {
+        /// What the task is waiting for
+        #[arg(value_enum)]
+        kind: AttentionKind,
+        /// Message for whoever watches the task (read from stdin if omitted)
+        message: Option<String>,
+        /// Task id (defaults to ZELLOOM_TASK_ID)
+        #[arg(long = "task", value_name = "ID")]
+        task: Option<String>,
+    },
+    /// Mark whether the running task's agent is inside a turn (busy) or waiting at its prompt (idle); meant for the agent's hooks
+    Turn {
+        /// The agent's turn state
+        #[arg(value_enum)]
+        state: TurnState,
+        /// Task id (defaults to ZELLOOM_TASK_ID)
+        #[arg(long = "task", value_name = "ID")]
+        task: Option<String>,
+    },
+    /// Type a reply into a running task's agent and press Enter (only after it reported question, gate or ready and ended its turn)
+    #[command(
+        after_help = "The reply must not start with '!' or '/' and may contain no control characters other than line breaks."
+    )]
+    Send {
+        /// Task id
+        task_id: String,
+        /// Id of the report this reply answers (`attention.id` in `loom show --json` or `loom watch`)
+        #[arg(long = "expect", value_name = "ATTENTION_ID")]
+        expect: u64,
+        /// Reply text (read from stdin if omitted)
+        text: Option<String>,
+    },
+    /// Stream task changes as JSON lines: a snapshot of active tasks, then `synced`, then every change
+    Watch,
     /// Stop loom core (refuses while tasks are running unless --force)
     Stop {
         /// Stop even if tasks are running; they become interrupted and their agents keep running until they exit
@@ -121,10 +172,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Add {
             workspace,
             agent,
+            source,
             text,
-        }) => cmd_add(workspace, agent, text),
-        Some(Command::Done { task_id }) => cmd_done(task_id),
-        Some(Command::List) => cmd_list(),
+        }) => tasks::cmd_add(workspace, agent, source, text),
+        Some(Command::Done { task_id }) => tasks::cmd_done(task_id),
+        Some(Command::List { json }) => tasks::cmd_list(json),
+        Some(Command::Show { task_id, json }) => tasks::cmd_show(&task_id, json),
+        Some(Command::Report {
+            kind,
+            message,
+            task,
+        }) => tasks::cmd_report(kind, message, task),
+        Some(Command::Turn { state, task }) => tasks::cmd_turn(state, task),
+        Some(Command::Send {
+            task_id,
+            expect,
+            text,
+        }) => tasks::cmd_send(task_id, expect, text),
+        Some(Command::Watch) => tasks::cmd_watch(),
         Some(Command::Stop { force }) => cmd_stop(force),
         Some(Command::Init) => cmd_init(),
         Some(Command::Workspace { command }) => match command {
@@ -223,125 +288,6 @@ fn wait_for_core_socket(
         "timed out waiting for loom core to start listening on {}",
         socket_path.display()
     );
-}
-
-fn cmd_add(
-    workspace: Option<String>,
-    agent: Option<String>,
-    text: Option<String>,
-) -> anyhow::Result<()> {
-    let text = match text {
-        Some(t) => t,
-        None => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf.trim_end().to_string()
-        }
-    };
-    if text.is_empty() {
-        anyhow::bail!("task text is empty");
-    }
-
-    let config_path = crate::paths::config_path();
-    let config = crate::config::load(&config_path)?;
-
-    let workspace = match workspace {
-        Some(w) => w,
-        None => {
-            let cwd = std::env::current_dir()?;
-            match crate::config::detect_workspace(&config, &cwd) {
-                Some(w) => w,
-                None if !config_path.exists() => return Err(missing_config_error(&config_path)),
-                None => {
-                    let suggested = crate::config::workspace_id_from_path(
-                        &crate::config::resolve_workspace_path(None, &cwd),
-                    )
-                    .unwrap_or_else(|_| "<ID>".to_string());
-                    anyhow::bail!(
-                        "could not auto-detect a workspace from the current directory.\n  register it:  loom workspace add {suggested}\n  or specify:   loom add -w <workspace> ..."
-                    );
-                }
-            }
-        }
-    };
-
-    if !config.workspaces.contains_key(&workspace) {
-        if !config_path.exists() {
-            return Err(missing_config_error(&config_path));
-        }
-        anyhow::bail!(
-            "workspace '{workspace}' is not registered; run `loom workspace add {workspace}` first"
-        );
-    }
-
-    let socket_path = crate::paths::socket_path();
-    let request = Request::Enqueue {
-        text,
-        workspace,
-        agent,
-        source: Source::cli(),
-        reply_to: None,
-        metadata: serde_json::json!({}),
-    };
-    let data = crate::client::call(&socket_path, &request)?;
-    let task: Task = serde_json::from_value(data)?;
-    println!(
-        "added task {} [{}] in workspace '{}'",
-        task.id,
-        task.status.as_str(),
-        task.workspace
-    );
-    Ok(())
-}
-
-fn missing_config_error(config_path: &std::path::Path) -> anyhow::Error {
-    anyhow::anyhow!(
-        "config file {} does not exist.\n  create it:    loom init\n  then:         cd <project> && loom workspace add",
-        config_path.display()
-    )
-}
-
-fn cmd_done(task_id: Option<String>) -> anyhow::Result<()> {
-    let task_id = task_id
-        .or_else(|| std::env::var("ZELLOOM_TASK_ID").ok())
-        .ok_or_else(|| anyhow::anyhow!("no task id given and ZELLOOM_TASK_ID is not set"))?;
-
-    let socket_path = crate::paths::socket_path();
-    crate::client::call(
-        &socket_path,
-        &Request::Complete {
-            task_id: task_id.clone(),
-        },
-    )?;
-    println!("task {task_id} marked done");
-    Ok(())
-}
-
-fn cmd_list() -> anyhow::Result<()> {
-    let socket_path = crate::paths::socket_path();
-    let data = crate::client::call(&socket_path, &Request::List)?;
-    let tasks: Vec<Task> = serde_json::from_value(data)?;
-
-    if tasks.is_empty() {
-        println!("(no tasks)");
-        return Ok(());
-    }
-
-    println!(
-        "{:<28}  {:<11}  {:<14}  {:<8}  TEXT",
-        "ID", "STATUS", "WORKSPACE", "AGENT"
-    );
-    for task in tasks {
-        println!(
-            "{:<28}  {:<11}  {:<14}  {:<8}  {}",
-            task.id,
-            task.status.as_str(),
-            task.workspace,
-            task.agent.unwrap_or_else(|| "-".to_string()),
-            task.text,
-        );
-    }
-    Ok(())
 }
 
 fn cmd_stop(force: bool) -> anyhow::Result<()> {
@@ -462,4 +408,69 @@ fn cmd_workspace_list() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clap_parses_conductor_commands() {
+        let cli = Cli::try_parse_from(["loom", "report", "gate", "push?", "--task", "t1"]).unwrap();
+        match cli.command {
+            Some(Command::Report {
+                kind,
+                message,
+                task,
+            }) => {
+                assert_eq!(kind, AttentionKind::Gate);
+                assert_eq!(message.as_deref(), Some("push?"));
+                assert_eq!(task.as_deref(), Some("t1"));
+            }
+            _ => panic!("expected report"),
+        }
+        assert!(Cli::try_parse_from(["loom", "report", "nope", "x"]).is_err());
+        assert!(Cli::try_parse_from(["loom", "send", "t1"]).is_err());
+        let cli = Cli::try_parse_from(["loom", "send", "t1", "--expect", "7"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Send {
+                expect: 7,
+                text: None,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["loom", "turn", "idle", "--task", "t1"]).unwrap();
+        match cli.command {
+            Some(Command::Turn { state, task }) => {
+                assert_eq!(state, TurnState::Idle);
+                assert_eq!(task.as_deref(), Some("t1"));
+            }
+            _ => panic!("expected turn"),
+        }
+        assert!(Cli::try_parse_from(["loom", "turn", "sleeping"]).is_err());
+        let cli = Cli::try_parse_from(["loom", "watch"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Watch)));
+    }
+
+    #[test]
+    fn clap_parses_new_flags() {
+        let cli = Cli::try_parse_from(["loom", "list", "--json"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::List { json: true })));
+        let cli = Cli::try_parse_from(["loom", "show", "t1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Show { json: false, .. })
+        ));
+        let cli = Cli::try_parse_from(["loom", "add", "--source", "hook", "text"]).unwrap();
+        match cli.command {
+            Some(Command::Add { source, .. }) => assert_eq!(source, "hook"),
+            _ => panic!("expected add"),
+        }
+        let cli = Cli::try_parse_from(["loom", "add", "text"]).unwrap();
+        match cli.command {
+            Some(Command::Add { source, .. }) => assert_eq!(source, "cli"),
+            _ => panic!("expected add"),
+        }
+    }
 }

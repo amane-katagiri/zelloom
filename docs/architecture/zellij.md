@@ -11,10 +11,14 @@
 | `zellij --session <name> action new-tab --name <name> --cwd <path> --no-focus -- <argv...>` | workspace 用タブを作り、その中で `loom runner ...` を起動する。標準出力に出る新しいタブの ID を返す | `Zellij::new_tab` |
 | `zellij --session <name> action move-tab --tab-id <id> left` | 作ったタブを管理タブの隣へ寄せる（1 回で 1 つ左へ） | `Zellij::move_tab_left` |
 | `zellij --session <name> action close-pane --pane-id terminal_<id>` | runner が正常終了するとき自分のペインを閉じる | `Zellij::close_pane`（`runner::close_own_pane`） |
+| `zellij --session <name> action write-chars --pane-id <id> -- <text>` | `send` の返信を agent のペインに打ち込む。`<name>` / `<id>` は runner 自身の `ZELLIJ_SESSION_NAME` / `ZELLIJ_PANE_ID` | `Zellij::write_chars`（`runner::type_into_own_pane`。[runner.md](runner.md#返信の入力)） |
+| `zellij --session <name> action write --pane-id <id> 13` | 返信のあとに Enter を送る | `Zellij::write_bytes`（同上） |
 | `zellij --session <name> action go-to-tab-name <name>` | 名前でタブへフォーカス移動 | TUI の `Enter`（`Zellij::go_to_tab_name`） |
 | `zellij --session <name> action close-tab-by-id <id>` | 終了済み runner のタブを閉じる（その後に新しいタブを作る） | `ZellijLauncher::launch` |
 
-すべて同期の `std::process::Command` 呼び出しで、`ZELLOOM_ZELLIJ` で `zellij` バイナリのパスを上書きできる（`Zellij` のメソッドは `zellij_bin()`、TUI は同じ環境変数を自分で読む）。`Zellij` のメソッドは `<name>` に core 起動時の `ZELLIJ_SESSION_NAME` を、TUI は TUI 自身の `ZELLIJ_SESSION_NAME` を使う。
+すべて同期の `std::process::Command` 呼び出しで（`write-chars` と `write` だけは時間制限付き。下記）、`ZELLOOM_ZELLIJ` で `zellij` バイナリのパスを上書きできる（`Zellij` のメソッドは `zellij_bin()`、TUI は同じ環境変数を自分で読む）。`Zellij` のメソッドは `<name>` に core 起動時の `ZELLIJ_SESSION_NAME` を、TUI は TUI 自身の `ZELLIJ_SESSION_NAME` を使う。
+
+- `write_chars` / `write_bytes` は呼び出し側が渡す時間制限（runner は 5 秒）を持つ。`zellij` を自分のプロセスグループで起動し、標準入力と標準出力は `/dev/null`、標準エラーは読み取ってエラーに含める。制限を超えたらプロセスグループに SIGKILL を送り、`ZellijError::Timeout` を返す。
 
 ## `--no-focus`
 
@@ -72,7 +76,7 @@ runner タブは、名前が workspace ID に一致し、かつ **runner ペイ�
 
 ## 素の `loom` 起動フロー
 
-`loom`（サブコマンド無し）は次を行う（`src/cli.rs` の `run_bare_loom` と `ensure_core`）。
+`loom`（サブコマンド無し）は次を行う（`src/cli/mod.rs` の `run_bare_loom` と `ensure_core`）。
 
 1. ソケットに接続できれば core は動いているとみなし、Zellij の有無に関係なく 3 へ進む。
 2. 接続できなければ、`ZELLIJ_SESSION_NAME` が無い場合は「core は Zellij セッションの中から起動する必要がある」というエラーで終了する。ある場合は core をデタッチ起動する（`setsid` した子プロセスとして `loom --socket <path> core` を起動し、stdin は `/dev/null`、stdout/stderr は状態ディレクトリの `core.log` に追記する。TUI の端末は引き継がない）。ソケットができるまで最大 5 秒待つ。その間に core が終了したら `loom core exited during startup (<status>); see <core.log>` で終了する。

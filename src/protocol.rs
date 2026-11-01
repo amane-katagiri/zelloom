@@ -80,6 +80,69 @@ pub struct Task {
     pub position: i64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<Attention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    Question,
+    Gate,
+    Blocked,
+    Ready,
+}
+
+impl AttentionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttentionKind::Question => "question",
+            AttentionKind::Gate => "gate",
+            AttentionKind::Blocked => "blocked",
+            AttentionKind::Ready => "ready",
+        }
+    }
+
+    pub fn awaits_reply(&self) -> bool {
+        matches!(
+            self,
+            AttentionKind::Question | AttentionKind::Gate | AttentionKind::Ready
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attention {
+    pub id: u64,
+    pub kind: AttentionKind,
+    pub message: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnState {
+    Busy,
+    Idle,
+}
+
+impl TurnState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TurnState::Busy => "busy",
+            TurnState::Idle => "idle",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputOutcome {
+    Typed,
+    NotTyped,
+    Partial,
 }
 
 fn default_metadata() -> serde_json::Value {
@@ -117,6 +180,9 @@ pub enum Request {
         metadata: serde_json::Value,
     },
     List,
+    Get {
+        task_id: String,
+    },
     Complete {
         task_id: String,
     },
@@ -157,6 +223,31 @@ pub enum Request {
     AgentExited {
         task_id: String,
         outcome: Outcome,
+    },
+    Report {
+        task_id: String,
+        kind: AttentionKind,
+        message: String,
+    },
+    Watch,
+    Send {
+        task_id: String,
+        expect: u64,
+        text: String,
+    },
+    Turn {
+        task_id: String,
+        state: TurnState,
+    },
+    InputResult {
+        task_id: String,
+        input_id: u64,
+        outcome: InputOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    AgentGone {
+        task_id: String,
     },
 }
 
@@ -217,8 +308,28 @@ pub struct ResolvedAgent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RunnerEvent {
-    Start { task: Task, agent: ResolvedAgent },
-    Stop { task_id: String },
+    Start {
+        task: Task,
+        agent: ResolvedAgent,
+    },
+    Stop {
+        task_id: String,
+    },
+    Input {
+        task_id: String,
+        input_id: u64,
+        text: String,
+    },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum WatchEvent {
+    Task { task: Task },
+    TaskDeleted { task_id: String },
+    Synced,
+    Error { error: String },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -283,6 +394,73 @@ mod tests {
         let resp_json = r#"{"ok":true,"data":null}"#;
         let msg: ServerMessage = serde_json::from_str(resp_json).unwrap();
         assert!(matches!(msg, ServerMessage::Response(_)));
+    }
+
+    #[test]
+    fn attention_is_omitted_when_absent_and_shaped_when_present() {
+        let mut task: Task = serde_json::from_str(
+            r#"{"id":"t","text":"x","status":"running","workspace":"w","source":{"type":"cli"},"position":1,"created_at":"c","updated_at":"u"}"#,
+        )
+        .unwrap();
+        assert!(task.attention.is_none());
+        assert!(!serde_json::to_string(&task).unwrap().contains("attention"));
+        task.attention = Some(Attention {
+            id: 7,
+            kind: AttentionKind::Gate,
+            message: "ok to push?".to_string(),
+            at: "a".to_string(),
+        });
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            value["attention"],
+            serde_json::json!({"id": 7, "kind": "gate", "message": "ok to push?", "at": "a"})
+        );
+        assert!(value.get("turn").is_none());
+        task.turn = Some(TurnState::Idle);
+        assert_eq!(serde_json::to_value(&task).unwrap()["turn"], "idle");
+    }
+
+    #[test]
+    fn watch_events_are_tagged() {
+        assert_eq!(
+            serde_json::to_string(&WatchEvent::Synced).unwrap(),
+            r#"{"event":"synced"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WatchEvent::TaskDeleted {
+                task_id: "t".to_string()
+            })
+            .unwrap(),
+            r#"{"event":"task_deleted","task_id":"t"}"#
+        );
+        let input: ServerMessage =
+            serde_json::from_str(r#"{"event":"input","task_id":"t","input_id":3,"text":"yes"}"#)
+                .unwrap();
+        assert!(matches!(
+            input,
+            ServerMessage::Event(RunnerEvent::Input { .. })
+        ));
+    }
+
+    #[test]
+    fn send_requires_expect_and_input_result_parses_outcome() {
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"send","task_id":"t","text":"x"}"#).is_err()
+        );
+        let json = r#"{"op":"input_result","task_id":"t","input_id":4,"outcome":"not_typed","error":"no pane"}"#;
+        match serde_json::from_str::<Request>(json).unwrap() {
+            Request::InputResult {
+                input_id,
+                outcome,
+                error,
+                ..
+            } => {
+                assert_eq!(input_id, 4);
+                assert_eq!(outcome, InputOutcome::NotTyped);
+                assert_eq!(error.as_deref(), Some("no pane"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

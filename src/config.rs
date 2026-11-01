@@ -69,6 +69,7 @@ pub enum ConfigError {
 }
 
 pub const INSTRUCTION_PLACEHOLDER: &str = "{instruction}";
+pub const LOOM_EXE_PLACEHOLDER: &str = "{loom_exe}";
 
 fn default_max_parallel() -> u32 {
     4
@@ -139,12 +140,28 @@ pub struct AgentConfig {
     pub command: Vec<String>,
     #[serde(default)]
     pub instruction_args: Option<Vec<String>>,
+    #[serde(default)]
+    pub instruction: Option<String>,
     #[serde(default = "default_true")]
     pub shell: bool,
     #[serde(default)]
     pub oneshot: bool,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl AgentConfig {
+    pub(crate) fn for_test(command: &[&str]) -> AgentConfig {
+        AgentConfig {
+            command: command.iter().map(|part| part.to_string()).collect(),
+            instruction_args: None,
+            instruction: None,
+            shell: true,
+            oneshot: false,
+            env: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -191,6 +208,11 @@ impl Config {
             if agent.oneshot && agent.instruction_args.is_some() {
                 return Err(ConfigError::Invalid(format!(
                     "agent '{name}' is oneshot and cannot have instruction_args"
+                )));
+            }
+            if agent.oneshot && agent.instruction.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "agent '{name}' is oneshot and cannot have instruction"
                 )));
             }
         }
@@ -611,35 +633,15 @@ mod tests {
             default_agent: Some("claude".to_string()),
             ..Config::default()
         };
-        config.agents.insert(
-            "claude".to_string(),
-            AgentConfig {
-                command: vec!["claude".into()],
-                instruction_args: None,
-                shell: true,
-                oneshot: false,
-                env: BTreeMap::new(),
-            },
-        );
-        config.agents.insert(
-            "codex".to_string(),
-            AgentConfig {
-                command: vec!["codex".into()],
-                instruction_args: None,
-                shell: true,
-                oneshot: false,
-                env: BTreeMap::new(),
-            },
-        );
+        config
+            .agents
+            .insert("claude".to_string(), AgentConfig::for_test(&["claude"]));
+        config
+            .agents
+            .insert("codex".to_string(), AgentConfig::for_test(&["codex"]));
         config.agents.insert(
             "opus".to_string(),
-            AgentConfig {
-                command: vec!["claude".into(), "--model".into(), "opus".into()],
-                instruction_args: None,
-                shell: true,
-                oneshot: false,
-                env: BTreeMap::new(),
-            },
+            AgentConfig::for_test(&["claude", "--model", "opus"]),
         );
         config.workspaces.insert(
             "amanejp".to_string(),
@@ -804,29 +806,15 @@ mod tests {
     #[test]
     fn agent_with_empty_command_is_error() {
         let mut config = Config::default();
-        config.agents.insert(
-            "broken".to_string(),
-            AgentConfig {
-                command: vec![],
-                instruction_args: None,
-                shell: true,
-                oneshot: false,
-                env: BTreeMap::new(),
-            },
-        );
+        config
+            .agents
+            .insert("broken".to_string(), AgentConfig::for_test(&[]));
         let err = config.validate().unwrap_err();
         assert!(matches!(err, ConfigError::EmptyAgentCommand(name) if name == "broken"));
 
-        config.agents.insert(
-            "broken".to_string(),
-            AgentConfig {
-                command: vec![String::new()],
-                instruction_args: None,
-                shell: true,
-                oneshot: false,
-                env: BTreeMap::new(),
-            },
-        );
+        config
+            .agents
+            .insert("broken".to_string(), AgentConfig::for_test(&[""]));
         assert!(matches!(
             config.validate().unwrap_err(),
             ConfigError::EmptyAgentCommand(_)
@@ -1032,6 +1020,39 @@ mod tests {
         .unwrap();
         let err = load(&config_path).unwrap_err();
         assert!(err.to_string().contains("oneshot"), "{err}");
+    }
+
+    #[test]
+    fn oneshot_rejects_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[agents.claude]\ncommand = [\"claude\", \"-p\"]\noneshot = true\ninstruction = \"hi\"\n",
+        )
+        .unwrap();
+        let err = load(&config_path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("agent 'claude' is oneshot and cannot have instruction"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn instruction_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[agents.claude]\ncommand = [\"claude\"]\ninstruction = \"run {loom_exe} done\"\n",
+        )
+        .unwrap();
+        let config = load(&config_path).unwrap();
+        assert_eq!(
+            config.agents["claude"].instruction.as_deref(),
+            Some("run {loom_exe} done")
+        );
     }
 
     #[test]

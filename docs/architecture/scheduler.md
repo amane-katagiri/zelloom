@@ -1,12 +1,12 @@
 # Scheduler とタスクの状態
 
-実装は `src/core/scheduler.rs`（各操作とスケジューリング）、`src/core/mod.rs`（接続処理と起動時処理）、`src/store.rs`（SQLite）。
+実装は `src/core/scheduler.rs`（各操作とスケジューリング）、`src/core/agent.rs`（agent の argv・環境変数・instruction の組み立てと `send` / `report` の本文の検査）、`src/core/mod.rs`（接続処理と起動時処理）、`src/store.rs`（SQLite）。
 
 ## 永続化
 
 - SQLite（`state.db`）の `tasks` テーブル 1 つ。列は `id, text, status, workspace, agent, source(JSON), reply_to(JSON), metadata(JSON), position, created_at, updated_at`。
 - `position` はグローバルキューの順序。新規作成と `retry` では「全タスクの最大 `position` + 1」を振る。`move` は隣のタスクと値を入れ替える。
-- 接続は 1 本を `std::sync::Mutex` で守って使う。
+- 接続は 1 本を `std::sync::Mutex` で守って使う。同じ Mutex の中に、タスクごとの `attention`（[下記](#attention)）と turn の記録（[下記](#turn)）を `HashMap` で持ち、`attention.id` などに使う core 全体の通し番号（u64、1 ずつ増える）も持つ。どれも SQLite に書かない。ストアが返す Task にはこれらから `attention` と `turn` を付ける。
 
 ## キューの順序と開始条件
 
@@ -49,11 +49,41 @@ interrupted にした場合は `schedule()` を呼ぶ。
 - core は workspace ごとに「接続中の runner」と「その runner の現在のタスク」を持つ（メモリ上のみ）。
 - 登録には接続ごとの attach ID（core 内の連番）を持たせる。切断時の後始末や `agent_exited` の検証は、この ID が一致する登録に対してだけ行う。
 - runner が接続したとき: その workspace に登録済みの runner があれば、新しい接続を拒否する（エラー応答を返して接続を閉じる。先の runner には触れない）。無ければ登録する。その workspace に `running` のタスクがあれば（`position` 順で最初のもの）、workspace と agent が解決できた場合にそれを現在のタスクにして `start` を送る（解決できなければ何もせず、attach タイムアウトで `interrupted` になる）。無ければ `schedule()`。
-- runner が切断したとき: 登録がその接続のもの（attach ID が一致）なら外し、現在のタスクがまだ `running` なら `interrupted` にする。そのあと `schedule()`。
+- runner が切断したとき: 登録がその接続のもの（attach ID が一致）なら外し、その runner の `input_result` を待っている `send` の登録を捨て、現在のタスクがまだ `running` なら `interrupted` にする。そのあと `schedule()`。
+- `agent_gone` / `input_result`: `agent_gone` は送信元の接続がその workspace の登録済み runner で、タスクがその runner の現在のタスクのときだけ受け付け、attention を消して turn を `busy` に作り直す。`input_result` は[下記](#turn)。
 - `complete` / `fail` / `cancel` で `running` のタスクを終えたとき: そのタスクが runner の現在のタスクなら `stop` を送り、現在のタスクを空にする。
 - `agent_exited`: 送信元の接続がその workspace の登録済み runner で、タスクがその runner の現在のタスクで、かつ `running` のときだけ受け付ける。`done` / `failed` は `running` からの条件付き更新で状態を変え、runner の現在のタスクを空にする。`restart` は設定を読み直して agent を再解決し、同じ runner に `start` を再送する。条件を満たさなければエラーを返し、何も変えない。
 - `restart` で再解決に失敗した（設定が読めない、workspace が設定に無い、agent が解決できない、解決した agent が `[agents]` に無い）ときは、タスクを `running` からの条件付き更新で `failed` にし、runner の現在のタスクを空にしてから `schedule()` を呼び、`cannot restart task '<id>': <理由>; the task was marked failed` のエラーを返す（条件付き更新が当たらなかった場合は末尾が `the task is no longer 'running'`）。runner はエラーを表示して待機を続ける。
 - 状態を変える操作はすべて、許可される状態を条件にした 1 つの SQL 文で更新する（[protocol.md](protocol.md#リクエスト一覧)）。`complete` / `fail` / `cancel` / `accept` / `reject` は `update_status_if`、`delete` は `delete_unless`（`running` 以外なら削除）、`edit` は `update_text_unless`（`running` 以外なら本文を更新）、`retry` は `retry_if`（`interrupted` / `failed` / `cancelled` なら `queued` にし、同じ文の中で最大 `position` + 1 を振る）。
+
+## attention
+
+`running` のタスクが「今なにを待っているか」を 1 件だけ持てる（形は [protocol.md](protocol.md#task)）。メモリ上にだけあり、core を再起動すると消える（そのとき `running` のタスクはどのみち `interrupted` になる）。
+
+- 設定: `report`。ストアのロックの中でタスクが `running` であることを確かめ、通し番号を 1 進めた値を `attention.id` にして置き換え、turn を `busy` にする（`Store::set_attention`）。`running` でなければエラーで、何も変えない。
+- 消去:
+  - タスクの状態が `running` から変わったとき、経路によらず（`complete` / `fail` / `cancel`、`agent_exited` の `done` / `failed`、runner の切断、attach タイムアウト、タブ起動の失敗、再解決に失敗した `restart`）。状態の条件付き更新（`update_status_if`）が、行き先が `running` でなければ同じロックの中で attention と turn の記録を消す。`retry` と `delete` も消す。core 起動時の `interrupted` 化はすべて消す。
+  - `agent_exited` の `restart` を受け付けたとき（`start` を再送する前。再送する Task には `attention` が無く、turn は `busy`）と、`agent_gone` を受け付けたとき（`Store::reset_turn`）。
+  - `send` を受け付けたとき（下記）。
+
+## turn
+
+`running` のタスクごとに、turn の状態（`busy` / `idle`）、最後に `idle` になったときの通し番号（ターンを終えた印）、配送中の `send` の `input_id` を持つ。
+
+- タスクが `running` になったとき（`update_status_if` の行き先が `running`）に `busy`・印なし・配送中なしで作り、`running` から離れたときに attention と一緒に消す。`restart` と `agent_gone` でも作り直す。
+- `turn idle`: 通し番号を 1 進めた値を印にして `idle` にする。`turn busy` と `report`: `busy` にする（印はそのまま）。
+- `send` は、runners のロックの中で runner の現在のタスクを確かめ、そのままストアのロックの中で「`running`・配送中なし・`attention.kind` が `question` / `gate` / `ready`・`attention.id == expect`・`idle` で印が `attention.id` より大きい」を確かめ（`Store::begin_send`）、attention を消して `busy` にし、通し番号から `input_id` を振って配送中にする。続けて同じ runners のロックの中で `input` を送り、ロックを放してから結果を待つ。確認と更新が 1 つのロックの中なので、同時に 2 つの `send` が来ても通るのは 1 つだけ。
+- 結果を待つ `send` は scheduler の表（`input_id` → 送信先 runner の attach ID と結果の受け口）に登録する。runner 接続の `input_result` は、attach ID とタスクが一致する登録にだけ結果を渡す。runner が切断すると、その attach ID の登録をすべて捨てる（待っている `send` は切断として終わる）。
+- 結果を受けたら配送中を解く（`Store::finish_send`）。`not_typed` のときは、配送中がまだその `input_id` で、かつ attention が空（新しい報告が来ていない）なら、元の attention に戻し、通し番号を 1 進めた値を印にして `idle` にする（`Store::abort_send`）。`agent_gone` や `restart`、`running` から離れたことで記録が作り直されていれば何もしない。
+
+## watch イベント
+
+watch 接続（[protocol.md](protocol.md#watch-接続)）に流す変化は、scheduler の各操作ではなくストアの更新メソッドが出す。ストアは `tokio::sync::broadcast` の送信側（容量 1024）を持ち、行を変えた更新（`insert` / `update_status_if` / `update_text_unless` / `retry_if` / `move_task` / `delete_unless`）と `attention` / `turn` の変更（`set_attention` / `set_turn`（値が変わったときだけ）/ `reset_turn` / `begin_send` / `abort_send`）が、ロックを持ったまま変化後の Task（削除なら `task_deleted`）を送る。条件に合わず何も変えなかった呼び出しは何も送らない。
+
+- 状態を変える経路はすべてストアの更新を通るので、`schedule()` の中での開始・`failed` 化、attach タイムアウト、runner の切断なども漏れなく届く。
+- 送信がロックの中なので、イベントは更新が確定した順に並ぶ。`Store::watch` は同じロックの中で購読を始め、スナップショット（`received` / `queued` / `running` / `interrupted`）を読むので、その間の変化を取りこぼさない。
+- core 起動時の `mark_all_running_interrupted` は送らない（その時点で購読者はいない）。
+- 購読者が 1024 件より遅れると、その接続は `broadcast` の `Lagged` を受け、エラー行を送って閉じる。他の購読者や送信側は待たされない。watch 接続は 1 リクエスト 1 応答の接続のような送信キューを持たず、ソケットに直接書く。書き込みが詰まったまま 10 秒（`ZELLOOM_WATCH_WRITE_TIMEOUT_MS`）を超えた接続は、書き込みを打ち切って閉じる。
 
 ## 状態遷移
 
@@ -109,6 +139,6 @@ interrupted にした場合は `schedule()` を呼ぶ。
 - 続けて設定ファイルを読み、`[http]` があれば TCP リスナーを bind する（[http.md](http.md#ライフサイクル)）。設定の読み込みか bind に失敗すると core は起動しない。
 - DB を開いた直後に `running` のタスクをすべて `interrupted` にする。
 - `shutdown` は `force` が false なら `running` のタスクがあるとき拒否する（[protocol.md](protocol.md#リクエスト一覧)）。受け付けると以後 `schedule()` は何もしない（新しいタスクの割り当ても タブの起動もしない）。
-- 受け付けたあとは待ち受けを止めてソケットファイルを消し、開いている接続をすべて閉じ、接続処理の終了を待ってから終了する。runner の接続は切断として扱われるので、実行中だったタスクはその場で `interrupted` になる。runner が未接続のまま `running` だったタスク（attach 待ち）は残り、次の起動時に `interrupted` になる。
+- 受け付けたあとは待ち受けを止めてソケットファイルを消し、開いている接続（watch 接続を含む）をすべて閉じ、接続処理の終了を待ってから終了する。runner の接続は切断として扱われるので、実行中だったタスクはその場で `interrupted` になる。runner が未接続のまま `running` だったタスク（attach 待ち）は残り、次の起動時に `interrupted` になる。
 - HTTP サーバが起動していれば、同じ shutdown の通知（`subscribe_shutdown`）を使って axum の graceful shutdown を行う。`core::run` はソケットの後始末が終わったあと、HTTP サーバのタスクが終わるのを待ってから戻る（[http.md](http.md#ライフサイクル)）。
 - 切断された runner は、待機中ならすぐ終了し、agent 実行中なら agent が終わるのを待ってから終了する（[runner.md](runner.md#core-との切断)）。

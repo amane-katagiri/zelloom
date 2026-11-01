@@ -1,5 +1,8 @@
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -17,6 +20,8 @@ pub enum ZellijError {
     Parse(#[from] serde_json::Error),
     #[error("unexpected zellij output: {0:?}")]
     UnexpectedOutput(String),
+    #[error("zellij did not finish within {} ms and was killed", .0.as_millis())]
+    Timeout(Duration),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +85,51 @@ impl Zellij {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    fn run_with_timeout(&self, args: &[&str], timeout: Duration) -> Result<(), ZellijError> {
+        let mut child = Command::new(zellij_bin())
+            .arg("--session")
+            .arg(&self.session)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .map_err(ZellijError::Spawn)?;
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text);
+                let _ = stderr_tx.send(text);
+            });
+        }
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(ZellijError::Spawn)? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                unsafe {
+                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ZellijError::Timeout(timeout));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if status.success() {
+            return Ok(());
+        }
+        Err(ZellijError::Command {
+            status,
+            stderr: stderr_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default(),
+        })
+    }
+
     pub fn list_tabs(&self) -> Result<Vec<TabInfo>, ZellijError> {
         let out = self.run(&["action", "list-tabs", "-a", "-j"])?;
         Ok(serde_json::from_str(&out)?)
@@ -123,6 +173,35 @@ impl Zellij {
     pub fn close_pane(&self, pane_id: &str) -> Result<(), ZellijError> {
         self.run(&["action", "close-pane", "--pane-id", pane_id])?;
         Ok(())
+    }
+
+    pub fn write_chars(
+        &self,
+        pane_id: &str,
+        text: &str,
+        timeout: Duration,
+    ) -> Result<(), ZellijError> {
+        self.run_with_timeout(
+            &["action", "write-chars", "--pane-id", pane_id, "--", text],
+            timeout,
+        )
+    }
+
+    pub fn write_bytes(
+        &self,
+        pane_id: &str,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<(), ZellijError> {
+        let mut args = vec![
+            "action".to_string(),
+            "write".to_string(),
+            "--pane-id".to_string(),
+            pane_id.to_string(),
+        ];
+        args.extend(bytes.iter().map(u8::to_string));
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_with_timeout(&args_ref, timeout)
     }
 
     pub fn go_to_tab_name(&self, name: &str) -> Result<(), ZellijError> {
