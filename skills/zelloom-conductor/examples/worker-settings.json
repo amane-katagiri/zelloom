@@ -1,0 +1,70 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh issue comment:*)",
+      "Bash(gh pr comment:*)"
+    ],
+    "deny": [
+      "AskUserQuestion"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"$ZELLOOM_TASK_ID\" ] || \"$ZELLOOM_LOOM_EXE\" turn idle"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"$ZELLOOM_TASK_ID\" ] || \"$ZELLOOM_LOOM_EXE\" turn busy"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"$ZELLOOM_TASK_ID\" ] || \"$ZELLOOM_LOOM_EXE\" turn busy"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"$ZELLOOM_TASK_ID\" ] || jq -r '\"permission dialog for \" + (.tool_name // \"a tool\")' | \"$ZELLOOM_LOOM_EXE\" report blocked >/dev/null"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "elicitation_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"$ZELLOOM_TASK_ID\" ] || jq -r '.message // \"an MCP server is asking for input\"' | \"$ZELLOOM_LOOM_EXE\" report blocked >/dev/null"
+          }
+        ]
+      }
+    ]
+  }
+}

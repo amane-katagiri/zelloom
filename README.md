@@ -432,6 +432,8 @@ zelloom の外にいる「監督役」（別の Claude Code のセッション�
 - 監督役は `loom watch` で報告と状態の変化を受け取り、`loom send <タスクID> --expect <報告ID> "返信"` で返信します。
 - プロトコルの詳細（`watch` の形式、報告の寿命、`send` を受け付ける条件と本文の規則）は [docs/architecture/protocol.md](docs/architecture/protocol.md#watch-接続) と [docs/architecture/scheduler.md](docs/architecture/scheduler.md#attention) にあります。
 
+Claude Code を監督役にするためのスキルと、ワーカー用のエージェント設定・hook の例を [skills/zelloom-conductor/](skills/zelloom-conductor/SKILL.md) に置いています。スキルのディレクトリを `~/.claude/skills/` にシンボリックリンクすると使えます。
+
 ### 環境変数とファイルの場所
 
 | 用途 | 既定の場所 | 変更するには |
